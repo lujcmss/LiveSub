@@ -206,6 +206,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         outputMonitor = AudioOutputMonitor { [weak self] in
             DispatchQueue.main.async { MainActor.assumeIsolated { self?.outputDeviceChanged() } }
         }
+        if Log.verbose {
+            // How close the live audio is to anything saved (helps explain slow or lost sync).
+            Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let sync = self.replay.sync else { return }
+                    let d = sync.diagnostics
+                    switch sync.state {
+                    case .searching: Log.debug("replay: searching, closest match " + (d.searchBest.map { String(format: "%.2f", $0) } ?? "none"))
+                    case .locked: Log.debug(String(format: "replay: locked, match quality %.2f", d.lockedErrorRate))
+                    case .paused: Log.debug("replay: paused")
+                    }
+                }
+            }
+        }
         Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.saveSession(announce: false) }
         }
@@ -447,7 +461,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             engine.handlePartial(text)
             render(stamp: received)
         case let .final(text, runs, latency, received):
-            recordCaptions(engine.handleFinal(text, runs: runs))
+            let completed = engine.handleFinal(text, runs: runs)
+            measureSentences(completed)
+            recordCaptions(completed)
             print("✓ \(text)" + (latency.map { String(format: "  [final %.0f ms after last word]", $0) } ?? ""))
             render(stamp: received)
         case .sentence:
@@ -468,6 +484,36 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setStatus(message)
         panel.subtitleView.showNotice(message)
         showOverlay()
+    }
+
+    static let stageSentenceComplete = "7a end of sentence spoken → sentence marked complete on screen"
+    static let stageSentenceTranslated = "7 end of sentence spoken → its translation shown"
+    static let stageDwell = "8 finished translation stays visible for"
+
+    /// Once the recognizer finalizes a sentence we know exactly when its last word was spoken:
+    /// compare that with when the sentence was marked complete and when its translation appeared.
+    private func measureSentences(_ captions: [CaptionTimeline.Caption]) {
+        guard let timeline = pipeline?.timeline else { return }
+        for caption in captions {
+            guard let end = caption.end, let spoken = timeline.hostTime(at: end) else { continue }
+            let timing = engine.timing(for: caption.source)
+            if let complete = timing.complete { stats.record(Self.stageSentenceComplete, ms: HostClock.ms(from: spoken, to: complete)) }
+            if let translated = timing.translated { stats.record(Self.stageSentenceTranslated, ms: HostClock.ms(from: spoken, to: translated)) }
+        }
+    }
+
+    /// Sources of finished translations currently on screen, and since when.
+    private var visibleTranslations: [String: UInt64] = [:]
+
+    /// Track how long each finished translation actually stays readable.
+    private func noteVisible(_ rows: [SubtitleView.Row]) {
+        let now = HostClock.now()
+        let current = Set(rows.filter { $0.translation != nil && !$0.isProvisional }.map(\.source))
+        for (source, since) in visibleTranslations where !current.contains(source) {
+            stats.record(Self.stageDwell, ms: HostClock.ms(from: since, to: now))
+            visibleTranslations[source] = nil
+        }
+        for source in current where visibleTranslations[source] == nil { visibleTranslations[source] = now }
     }
 
     private func recordCaptions(_ captions: [CaptionTimeline.Caption]) {
@@ -534,6 +580,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             SubtitleView.Row(source: $0.source, translation: $0.translation, isProvisional: $0.isProvisional)
         }
         if !rows.isEmpty { rows[rows.count - 1].tentativeCount = engine.tentativeCount }
+        // A sentence that has only just begun (a few characters, no translation yet) does not
+        // push the finished sentence and its translation off screen: wait until it has
+        // something to show for itself.
+        if rows.count >= 2, let last = rows.last, last.translation == nil, last.source.count < 6 {
+            rows.removeLast()
+        }
         // Start at a sentence boundary: drop whole leading sentences until the rest fits.
         if rows.isEmpty, SettingsWindowController.isOpen || isResizing {
             // Nothing is being said: show a sample so appearance changes can be judged.
@@ -543,6 +595,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let first = window.firstVisible(count: rows.count) { view.fits(Array(rows[$0...])) }
         view.update(rows: Array(rows.dropFirst(first)), stamp: stamp)
+        noteVisible(Array(rows.dropFirst(first)))
         guard !rows.isEmpty else { return }
         showOverlay()
         scheduleIdleFade(after: config.idleSeconds)

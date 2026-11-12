@@ -66,9 +66,10 @@ final class ReplayController {
     private func stateChanged(_ state: SessionMatcher.State) {
         switch state {
         case .searching:
-            print("replay: lost sync, back to live subtitles")
+            print(String(format: "replay: lost sync, back to live subtitles (last match quality %.2f)", sync?.diagnostics.lockedErrorRate ?? 1))
         case let .locked(id, delta):
             let heard = sync?.recording().seconds ?? 0
+            Log.debug(String(format: "replay: lock quality %.2f (0 = identical, 0.5 = unrelated, limit 0.30)", sync?.diagnostics.lockedErrorRate ?? 1))
             print(String(format: "replay: in sync with saved session %@ (offset %.2f s) after %.1f s of audio", String(id.prefix(8)), Double(delta) * AudioFingerprinter.hopSeconds, heard))
         case let .paused(id, frame):
             print(String(format: "replay: paused at %.2f s of %@", Double(frame) * AudioFingerprinter.hopSeconds, String(id.prefix(8))))

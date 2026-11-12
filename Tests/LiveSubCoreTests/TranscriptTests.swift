@@ -415,3 +415,32 @@ private func fin(_ t: String, _ a: Double, _ b: Double) -> ASRResult { ASRResult
         #expect(m.state == .searching)
     }
 }
+
+@Suite struct PauseDetectorTests {
+    /// Feed 100 ms chunks at the given levels; return the indices where a pause was reported.
+    private func pauses(_ levels: [Float]) -> [Int] {
+        var d = PauseDetector()
+        return levels.enumerated().compactMap { d.note(levelDB: $1, duration: 0.1) ? $0 : nil }
+    }
+
+    @Test func reportsOncePerPauseAfterEnoughSpeech() {
+        let speech = [Float](repeating: -20, count: 10), gap = [Float](repeating: -60, count: 8)
+        // The pause is reported on its third quiet chunk (0.3 s), and only once.
+        #expect(pauses(speech + gap + speech + gap) == [12, 30])
+    }
+
+    @Test func musicUnderSpeechStillCountsAsAPause() {
+        // Speech at -18 dB over music at -36 dB: the drop is what matters, not silence.
+        let speech = [Float](repeating: -18, count: 10), music = [Float](repeating: -36, count: 6)
+        #expect(pauses(speech + music) == [12])
+    }
+
+    @Test func ignoresBlipsAndSteadyNoise() {
+        // A 0.1 s dip is not a pause.
+        #expect(pauses([-20, -20, -20, -20, -20, -20, -50, -20, -20, -20]).isEmpty)
+        // Constant level: nothing to report.
+        #expect(pauses([Float](repeating: -30, count: 40)).isEmpty)
+        // Quiet before any speech: nothing to commit.
+        #expect(pauses([Float](repeating: -70, count: 20)).isEmpty)
+    }
+}

@@ -72,6 +72,13 @@ public final class ReplaySync: @unchecked Sendable {
         }
     }
 
+    /// Matching quality right now, for logs: (bit error rate of the current lock, closest
+    /// candidate while searching).
+    public var diagnostics: (lockedErrorRate: Double, searchBest: Double?) {
+        lock.lock(); defer { lock.unlock() }
+        return (matcher.lastErrorRate, matcher.lastSearchBest)
+    }
+
     // MARK: Recording
 
     /// Fingerprints of everything heard so far, and how much of it was not found in a saved session.

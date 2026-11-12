@@ -33,7 +33,7 @@ public final class CaptionEngine {
     public let translator: Translator?
     public var eagerTranslation: Bool
     /// Shortest unfinished text worth translating eagerly (characters).
-    public var eagerMinimumLength = 4
+    public var eagerMinimumLength = 2
 
     private let stats: LatencyStats
     private var cache: [String: String] = [:]
@@ -172,7 +172,16 @@ public final class CaptionEngine {
         }
     }
 
+    /// When a sentence was first seen complete, and when its translation arrived (host times).
+    public func timing(for source: String) -> (complete: UInt64?, translated: UInt64?) {
+        (firstSeenComplete[source], translatedAt[source])
+    }
+
+    private var translatedAt: [String: UInt64] = [:]
+
     private func store(_ translation: String, for source: String) {
+        translatedAt[source] = HostClock.now()
+        if translatedAt.count > 600 { translatedAt.removeAll() }
         if cache[source] == nil { cacheOrder.append(source) }
         cache[source] = translation
         if cacheOrder.count > 300 {

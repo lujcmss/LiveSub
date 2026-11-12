@@ -202,6 +202,14 @@ public struct SessionMatcher: Sendable {
                 }
             }
         }
+        // For diagnostics: the closest alignment found, whether or not it was good enough.
+        var closest = 1.0
+        for (key, _) in candidates.prefix(3) {
+            let id = referenceIDs[Int(key >> 40)]
+            let delta = Int(key & ((1 << 40) - 1)) - (1 << 30)
+            if let saved = references[id], let rate = errorRate(saved: saved, delta: delta, window: tuning.lockWindow) { closest = min(closest, rate) }
+        }
+        lastSearchBest = candidates.isEmpty ? nil : closest
         if let best {
             state = .locked(id: best.id, delta: best.delta)
             lastErrorRate = best.rate
@@ -210,6 +218,8 @@ public struct SessionMatcher: Sendable {
         }
     }
 
+    /// Closest bit error rate found by the last search (nil: nothing even resembled the audio).
+    public private(set) var lastSearchBest: Double?
     /// Bit error rate of the most recent successful comparison (diagnostics).
     public private(set) var lastErrorRate: Double = 1
 

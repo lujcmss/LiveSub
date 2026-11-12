@@ -50,6 +50,9 @@ public protocol ASRBackend: AnyObject, Sendable {
     func start() async throws -> AsyncThrowingStream<ASRResult, Error>
     /// Feed the next contiguous block of audio, in the format returned by `prepare`.
     func feed(_ buffer: AVAudioPCMBuffer)
+    /// Ask for final results for everything fed so far, without ending recognition. Called at a
+    /// pause in speech so finished sentences are committed (and translated) sooner.
+    func finalizePending()
     /// Flush pending audio, emit the last results and end the stream.
     func finish() async
 }

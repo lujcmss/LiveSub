@@ -11,6 +11,9 @@ struct SubtitleStyle {
     var textColor: NSColor = .white
     /// How much dimmer still-changing text is drawn.
     var volatileOpacity: CGFloat = 0.55
+    /// A translation of a sentence still being spoken: nearly full strength, because it is
+    /// what the viewer reads while the sentence unfolds.
+    var provisionalOpacity: CGFloat = 0.88
     var backgroundColor: NSColor = .black
     var backgroundOpacity: CGFloat = 0.62
     /// Lines for the main text (and, when both are shown, as many again for the original).
@@ -132,7 +135,7 @@ struct SubtitleStyle {
     }
 
     /// Text attributes for a line. `dim` marks text that may still change.
-    func attributes(_ role: Role, dim: Bool, spacingBefore: CGFloat = 0) -> [NSAttributedString.Key: Any] {
+    func attributes(_ role: Role, dim: Bool, provisional: Bool = false, spacingBefore: CGFloat = 0) -> [NSAttributedString.Key: Any] {
         let shadow = NSShadow()
         shadow.shadowColor = NSColor.black.withAlphaComponent(0.8)
         shadow.shadowBlurRadius = 3
@@ -151,7 +154,7 @@ struct SubtitleStyle {
         let color = isSecondary(role) ? originalColor : textColor
         return [
             .font: font(for: role),
-            .foregroundColor: color.withAlphaComponent(dim ? volatileOpacity : 1),
+            .foregroundColor: color.withAlphaComponent(dim ? volatileOpacity : provisional ? provisionalOpacity : 1),
             .shadow: shadow,
             .paragraphStyle: paragraph,
         ]

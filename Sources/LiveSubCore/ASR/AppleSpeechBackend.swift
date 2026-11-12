@@ -209,6 +209,15 @@ public final class AppleSpeechBackend: ASRBackend, @unchecked Sendable {
 
     public func feed(_ buffer: AVAudioPCMBuffer) {
         input?.yield(AnalyzerInput(buffer: buffer))
+        fedFrames += Int64(buffer.frameLength)
+    }
+
+    private var fedFrames: Int64 = 0
+
+    public func finalizePending() {
+        guard let analyzer, let format else { return }
+        let through = CMTime(value: fedFrames, timescale: CMTimeScale(format.sampleRate))
+        Task { try? await analyzer.finalize(through: through) }
     }
 
     public func finish() async {

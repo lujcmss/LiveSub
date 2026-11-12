@@ -218,7 +218,7 @@ final class SubtitleView: NSView {
                 let text = row.translation ?? row.source
                 appendSeparator(before: text, .translation)
                 if let t = row.translation {
-                    append(t, style.attributes(.translation, dim: row.isProvisional))
+                    append(t, style.attributes(.translation, dim: false, provisional: row.isProvisional))
                 } else {
                     appendOriginal(row, dimAll: true)
                 }
@@ -232,7 +232,7 @@ final class SubtitleView: NSView {
                 append("\n", style.attributes(.original, dim: false, spacingBefore: gap))
                 // The translation line is reserved with "…" so the layout does not jump when
                 // the translation arrives.
-                append(row.translation ?? "…", style.attributes(.translation, dim: row.translation == nil || row.isProvisional))
+                append(row.translation ?? "…", style.attributes(.translation, dim: row.translation == nil, provisional: row.isProvisional))
             }
         }
         return out

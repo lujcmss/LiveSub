@@ -25,6 +25,7 @@ public final class TranscriptionPipeline: @unchecked Sendable {
         public static let final = "3 word spoken → final text"
         public static let finalFromStart = "3b phrase start → final text"
         public static let display = "4 recognizer output → drawn on screen"
+        public static let pauseFinalize = "(pauses that triggered an early commit)"
     }
 
     public let stats: LatencyStats
@@ -37,6 +38,13 @@ public final class TranscriptionPipeline: @unchecked Sendable {
     /// Audio that arrives while the recognizer is still starting is fed once it is ready.
     private var accepting = false
     private var sawAudio = false
+    /// Commit pending text as soon as the speaker pauses, instead of waiting for the
+    /// recognizer to do it on its own schedule. Off by default: measured on a recording it
+    /// brought final text forward (p95 953 → 396 ms after the last word) but did not make
+    /// sentences complete, or their translations appear, any sooner, and it risks cutting a
+    /// sentence at a short pause. Enable with LIVESUB_PAUSE_COMMIT=1 to experiment.
+    public var finalizeAtPauses = ProcessInfo.processInfo.environment["LIVESUB_PAUSE_COMMIT"] != nil
+    private var pauses = PauseDetector()
     /// Called on the audio queue with every chunk fed to the recognizer (set before `run`).
     public var onChunk: (@Sendable (AudioChunk) -> Void)?
 
@@ -106,6 +114,10 @@ public final class TranscriptionPipeline: @unchecked Sendable {
             let duration = Double(chunk.buffer.frameLength) / chunk.buffer.format.sampleRate
             timeline.append(duration: duration, startHostTime: chunk.startHostTime)
             backend.feed(chunk.buffer)
+            if pauses.note(levelDB: chunk.levelDB, duration: duration), finalizeAtPauses {
+                backend.finalizePending()
+                stats.record(Stage.pauseFinalize, ms: 0)
+            }
             onChunk?(chunk)
             stats.record(Stage.capture, ms: HostClock.ms(from: chunk.endHostTime, to: HostClock.now()))
         }
@@ -116,5 +128,44 @@ public final class TranscriptionPipeline: @unchecked Sendable {
         source.stop()
         queue.sync { accepting = false }
         await backend.finish()
+    }
+}
+
+/// Spots a pause in speech from loudness alone: the level drops well below recent speech for a
+/// moment. Works with background music because it compares against the recent peak rather than
+/// against silence.
+public struct PauseDetector: Sendable {
+    /// How far below the recent peak counts as a pause (dB), and for how long (seconds).
+    public var drop: Float = 14
+    public var hold: Double = 0.3
+    /// Speech needed since the last pause before another one is reported (seconds).
+    public var minimumSpeech: Double = 0.5
+
+    private var peak: Float = -160
+    private var quiet = 0.0
+    private var speech = 0.0
+    private var reported = false
+
+    public init() {}
+
+    /// Feed one chunk's level. Returns true once per pause, when it has lasted `hold` seconds.
+    public mutating func note(levelDB: Float, duration: Double) -> Bool {
+        // The reference peak fades slowly so a loud scene does not mask later quiet speech.
+        peak = max(levelDB, peak - Float(duration) * 3)
+        let isQuiet = levelDB < peak - drop || levelDB < -55
+        if isQuiet {
+            quiet += duration
+            if quiet >= hold, !reported, speech >= minimumSpeech {
+                reported = true
+                speech = 0
+                return true
+            }
+        } else {
+            if quiet >= hold { reported = false }
+            quiet = 0
+            speech += duration
+            reported = false
+        }
+        return false
     }
 }
