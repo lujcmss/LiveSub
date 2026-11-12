@@ -78,19 +78,44 @@ struct SubtitleStyle {
         return NSFont(descriptor: descriptor, size: size) ?? base
     }
 
+    /// Line height as a multiple of the font size. Smaller = lines closer together.
+    var lineSpacing: CGFloat = 1.12
+
+    nonisolated(unsafe) private static let leadingCache = NSCache<NSString, NSNumber>()
+
+    /// Factor that brings `role`'s font from its natural line height to `lineSpacing` em.
+    private func leadingMultiple(for role: Role) -> CGFloat {
+        let font = font(for: role)
+        let language = role == .original ? originalLanguage : translationLanguage
+        let key = "\(fontName)|\(font.pointSize)|\(language)" as NSString
+        let natural: CGFloat
+        if let cached = Self.leadingCache.object(forKey: key) {
+            natural = CGFloat(cached.doubleValue)
+        } else {
+            let sample = NSAttributedString(string: Self.sample(for: language), attributes: [.font: font])
+            natural = TailFitter.layout(sample, width: 2000).size.height
+            Self.leadingCache.setObject(NSNumber(value: Double(natural)), forKey: key)
+        }
+        guard natural > 0 else { return 1 }
+        return min(1, font.pointSize * lineSpacing / natural)
+    }
+
+    private static func sample(for language: String) -> String {
+        switch language {
+        case "ja": "あ漢g"
+        case "zh-Hans", "zh-Hant": "汉g"
+        case "ko": "한g"
+        default: "Ag"
+        }
+    }
+
     /// Extra space above each sentence pair after the first, so pairs read as units.
-    var pairSpacing: CGFloat { (fontSize * 0.4).rounded() }
+    var pairSpacing: CGFloat { (fontSize * 0.45).rounded() }
 
     /// Measured height of one line of `role` text in its language (fonts differ a lot here).
     func lineHeight(for role: Role) -> CGFloat {
         let language = role == .original ? originalLanguage : translationLanguage
-        let sample: String
-        switch language {
-        case "ja": sample = "あ漢g"
-        case "zh-Hans", "zh-Hant": sample = "汉g"
-        case "ko": sample = "한g"
-        default: sample = "Ag"
-        }
+        let sample = Self.sample(for: language)
         let text = NSAttributedString(string: sample, attributes: attributes(role, dim: false))
         return TailFitter.layout(text, width: 2000).size.height
     }
@@ -120,6 +145,9 @@ struct SubtitleStyle {
         // (No fixed line height: TextKit inflates Hiragino lines when one is set, so line
         // heights are measured instead; see `lineHeight(for:)`.)
         paragraph.paragraphSpacingBefore = spacingBefore
+        // Fonts carry very different built-in leading (Hiragino 1.5 em, Avenir 1.37 em); scale
+        // each line down to the same tight leading so a sentence and its translation sit together.
+        paragraph.lineHeightMultiple = leadingMultiple(for: role)
         let color = isSecondary(role) ? originalColor : textColor
         return [
             .font: font(for: role),

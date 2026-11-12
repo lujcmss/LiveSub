@@ -36,7 +36,7 @@ final class OverlayPanel: NSPanel {
 
     /// Height follows the style (lines × line height); the user controls width and position.
     func applyHeight(for style: SubtitleStyle) {
-        let height = style.contentHeight + style.padding.height * 2 + 8
+        let height = style.contentHeight + style.padding.height * 2 + (style.fontSize * 0.14).rounded() + 8
         contentMinSize = NSSize(width: 320, height: height)
         contentMaxSize = NSSize(width: 10_000, height: height)
         var f = frame
@@ -214,13 +214,16 @@ final class SubtitleView: NSView {
                 Log.debug("layout: lines \(heights.joined(separator: ",")) total \(fitted.size.height) in view \(bounds.height)")
             }
             // Pill hugs the text, centered, sitting on the bottom edge of the window.
+            // With tight leading the first line's tall glyphs rise above its line box; give
+            // them room at the top.
+            let topInset = (style.fontSize * 0.14).rounded()
             let pillSize = NSSize(width: fitted.size.width + style.padding.width * 2,
-                                  height: fitted.size.height + style.padding.height * 2)
+                                  height: fitted.size.height + style.padding.height * 2 + topInset)
             let pill = NSRect(x: (bounds.width - pillSize.width) / 2, y: bounds.height - pillSize.height - 4,
                               width: pillSize.width, height: pillSize.height)
             style.backgroundColor.withAlphaComponent(style.backgroundOpacity).setFill()
             NSBezierPath(roundedRect: pill, xRadius: style.cornerRadius, yRadius: style.cornerRadius).fill()
-            fitted.draw(at: NSPoint(x: (bounds.width - available) / 2, y: pill.minY + style.padding.height))
+            fitted.draw(at: NSPoint(x: (bounds.width - available) / 2, y: pill.minY + style.padding.height + topInset))
         }
         if let stamp = pendingStamp {
             pendingStamp = nil
