@@ -11,6 +11,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/livesub"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 # Ad-hoc signature with a stable identifier so macOS privacy permissions stick to the bundle ID.
 codesign --force --sign - --identifier app.livesub.LiveSub --options runtime \
   --entitlements Resources/LiveSub.entitlements "$APP"

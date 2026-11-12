@@ -1,5 +1,7 @@
 # LiveSub
 
+<img src="docs/icon.png" width="96" alt="LiveSub icon">
+
 Live subtitles, with a translation, for anything your Mac is playing: a Netflix tab, a video
 call, a podcast. Everything runs on your Mac; no audio or text is sent anywhere.
 macOS 26.4 or later, Apple silicon.
