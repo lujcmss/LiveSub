@@ -27,21 +27,60 @@ final class OverlayPanel: NSPanel {
         applyHeight(for: style)
         restoreOrPlaceDefault()
         NotificationCenter.default.addObserver(self, selector: #selector(frameChanged), name: NSWindow.didMoveNotification, object: self)
-        NotificationCenter.default.addObserver(self, selector: #selector(frameChanged), name: NSWindow.didEndLiveResizeNotification, object: self)
+        NotificationCenter.default.addObserver(self, selector: #selector(didEndResize), name: NSWindow.didEndLiveResizeNotification, object: self)
+        NotificationCenter.default.addObserver(self, selector: #selector(didResize), name: NSWindow.didResizeNotification, object: self)
     }
 
     // Never steal keyboard focus from the video player.
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 
-    /// Height follows the style (lines × line height); the user controls width and position.
+    static let fontSizeRange: ClosedRange<CGFloat> = 12...96
+
+    /// Window height that exactly fits the style's lines.
+    static func height(for style: SubtitleStyle) -> CGFloat {
+        style.contentHeight + style.padding.height * 2 + (style.fontSize * 0.14).rounded() + 8
+    }
+
+    /// The font size at which the style's lines fill a window of `height`: lets the user size
+    /// the text by dragging the window taller or shorter.
+    static func fontSize(forHeight height: CGFloat, style: SubtitleStyle) -> CGFloat {
+        var lo = fontSizeRange.lowerBound, hi = fontSizeRange.upperBound
+        var probe = style
+        for _ in 0..<9 {
+            let mid = (lo + hi) / 2
+            probe.fontSize = mid
+            if Self.height(for: probe) > height { hi = mid } else { lo = mid }
+        }
+        return ((lo + hi) / 2).rounded()
+    }
+
+    /// Called while the user drags the window's edge (argument: the new size).
+    var onLiveResize: ((NSSize) -> Void)?
+    /// Called when the drag ends.
+    var onEndResize: (() -> Void)?
+
+    /// Height follows the style (lines × line height). Width and position are the user's; so
+    /// is height while they are dragging, which resizes the text instead.
     func applyHeight(for style: SubtitleStyle) {
-        let height = style.contentHeight + style.padding.height * 2 + (style.fontSize * 0.14).rounded() + 8
-        contentMinSize = NSSize(width: 320, height: height)
-        contentMaxSize = NSSize(width: 10_000, height: height)
+        var smallest = style, largest = style
+        smallest.fontSize = Self.fontSizeRange.lowerBound
+        largest.fontSize = Self.fontSizeRange.upperBound
+        contentMinSize = NSSize(width: 320, height: Self.height(for: smallest))
+        contentMaxSize = NSSize(width: 10_000, height: Self.height(for: largest))
+        guard !inLiveResize else { return }
         var f = frame
-        f.size.height = height
+        f.size.height = Self.height(for: style)
         setFrame(f, display: true)
+    }
+
+    @objc private func didResize() {
+        if inLiveResize { onLiveResize?(frame.size) }
+    }
+
+    @objc private func didEndResize() {
+        onEndResize?()
+        frameChanged()
     }
 
     private func restoreOrPlaceDefault() {

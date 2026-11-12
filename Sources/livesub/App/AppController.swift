@@ -55,6 +55,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isReady = false
     private var isHovering = false
     private var isRepositioning = false
+    private var isResizing = false
     private var snapshotIndex = 0
     private var lastSnapshot = ""
 
@@ -119,6 +120,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.subtitleView.onDrawn = { [stats] stamp in
             stats.record(TranscriptionPipeline.Stage.display, ms: HostClock.ms(from: stamp, to: HostClock.now()))
         }
+        // Dragging the window taller or shorter resizes the text to fit it.
+        panel.onLiveResize = { [weak self] size in
+            guard let self else { return }
+            self.isResizing = true
+            let fitted = OverlayPanel.fontSize(forHeight: size.height, style: self.config.style)
+            guard fitted != self.config.style.fontSize else { return }
+            self.config.style.fontSize = fitted
+            self.panel.subtitleView.style = self.config.style
+            self.window.reset()
+            self.replayRows = []
+            self.render(stamp: nil)
+        }
+        panel.onEndResize = { [weak self] in
+            guard let self, self.isResizing else { return }
+            self.isResizing = false
+            // Remember the size; this also snaps the window to fit the text exactly.
+            if self.settings.fontSize != Double(self.config.style.fontSize) {
+                self.settings.fontSize = Double(self.config.style.fontSize)
+            } else {
+                self.applyStyle()
+            }
+            self.scheduleIdleFade(after: 1.5)
+        }
         panel.subtitleView.hoverChanged = { [weak self] inside in
             self?.isHovering = inside
             self?.refreshFrameOutline()
@@ -172,6 +196,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.saveSession(announce: false) }
+        }
+        if Log.verbose {
+            // Sanity check of drag-to-resize: a window sized for N pt must map back to N pt.
+            for size in [14, 22, 30, 44, 72] as [CGFloat] {
+                var probe = config.style
+                probe.fontSize = size
+                let h = OverlayPanel.height(for: probe)
+                Log.debug("resize check: \(Int(size)) pt needs height \(Int(h)); that height gives \(Int(OverlayPanel.fontSize(forHeight: h, style: config.style))) pt")
+            }
         }
         panel.orderFrontRegardless()
         Log.debug("overlay frame \(NSStringFromRect(panel.frame)), level \(panel.level.rawValue), behavior \(panel.collectionBehavior.rawValue), visible \(panel.isVisible), clickThrough \(panel.clickThrough), screen \(NSStringFromRect(NSScreen.main?.frame ?? .zero))")
@@ -473,7 +506,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if !rows.isEmpty { rows[rows.count - 1].tentativeCount = engine.tentativeCount }
         // Start at a sentence boundary: drop whole leading sentences until the rest fits.
-        if rows.isEmpty, SettingsWindowController.isOpen {
+        if rows.isEmpty, SettingsWindowController.isOpen || isResizing {
             // Nothing is being said: show a sample so appearance changes can be judged.
             view.update(rows: [sampleRow])
             showOverlay()
@@ -510,7 +543,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         idleTimer?.invalidate()
         idleTimer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, !self.isRepositioning, !SettingsWindowController.isOpen else { return }
+                guard let self, !self.isRepositioning, !self.isResizing, !SettingsWindowController.isOpen else { return }
                 NSAnimationContext.runAnimationGroup({ ctx in
                     ctx.duration = 0.6
                     self.panel.animator().alphaValue = 0
@@ -802,7 +835,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         isRepositioning = true
         let wasClickThrough = panel.clickThrough
         panel.clickThrough = false
-        if panel.subtitleView.isEmpty { panel.subtitleView.showNotice("Drag to move · drag the left or right edge to resize") }
+        if panel.subtitleView.isEmpty { panel.subtitleView.showNotice("Drag to move · drag an edge to resize the text") }
         refreshFrameOutline()
         showOverlay()
         Timer.scheduledTimer(withTimeInterval: 8, repeats: false) { [weak self] _ in

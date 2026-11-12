@@ -34,7 +34,8 @@ Everything is in the menu-bar icon:
 - **Pause**, **Click Through Subtitles**, **Move or Resize Subtitles…**
 - **Settings…**: font, size, colors, line spacing, how long subtitles stay, saved subtitles
 
-Drag the subtitles to move them; hover and drag the left or right edge to resize.
+Drag the subtitles to move them. Hover to see the frame, then drag its top or bottom edge to make
+the text larger or smaller, or its left or right edge to change the width.
 
 | Shortcut | Does |
 |---|---|
