@@ -9,7 +9,9 @@ final class OverlayPanel: NSPanel {
 
     init(style: SubtitleStyle) {
         subtitleView = SubtitleView(style: style)
-        super.init(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel, .resizable],
+        // Moving and resizing are handled by SubtitleView itself (see its mouse handling), so
+        // the window is neither system-resizable nor movable by its background.
+        super.init(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
                    backing: .buffered, defer: false)
         isOpaque = false
         backgroundColor = .clear
@@ -20,15 +22,26 @@ final class OverlayPanel: NSPanel {
         level = .statusBar
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         hidesOnDeactivate = false
-        isMovableByWindowBackground = true
+        isMovableByWindowBackground = false
         isReleasedWhenClosed = false
         animationBehavior = .none
         contentView = subtitleView
         applyHeight(for: style)
         restoreOrPlaceDefault()
         NotificationCenter.default.addObserver(self, selector: #selector(frameChanged), name: NSWindow.didMoveNotification, object: self)
-        NotificationCenter.default.addObserver(self, selector: #selector(didEndResize), name: NSWindow.didEndLiveResizeNotification, object: self)
-        NotificationCenter.default.addObserver(self, selector: #selector(didResize), name: NSWindow.didResizeNotification, object: self)
+        subtitleView.onResize = { [weak self] frame in
+            guard let self else { return }
+            self.isUserResizing = true
+            self.setFrame(frame, display: true)
+            self.onLiveResize?(frame.size)
+        }
+        subtitleView.onResizeEnded = { [weak self] in
+            guard let self else { return }
+            self.onEndResize?()
+            self.isUserResizing = false
+            self.frameChanged()
+        }
+        subtitleView.sizeLimits = { [weak self] in (self?.contentMinSize ?? .zero, self?.contentMaxSize ?? NSSize(width: 10_000, height: 10_000)) }
     }
 
     // Never steal keyboard focus from the video player.
@@ -68,20 +81,14 @@ final class OverlayPanel: NSPanel {
         largest.fontSize = Self.fontSizeRange.upperBound
         contentMinSize = NSSize(width: 320, height: Self.height(for: smallest))
         contentMaxSize = NSSize(width: 10_000, height: Self.height(for: largest))
-        guard !inLiveResize else { return }
+        guard !isUserResizing else { return }
         var f = frame
         f.size.height = Self.height(for: style)
         setFrame(f, display: true)
     }
 
-    @objc private func didResize() {
-        if inLiveResize { onLiveResize?(frame.size) }
-    }
-
-    @objc private func didEndResize() {
-        onEndResize?()
-        frameChanged()
-    }
+    /// True while the user is dragging an edge.
+    private(set) var isUserResizing = false
 
     private func restoreOrPlaceDefault() {
         if let saved = UserDefaults.standard.string(forKey: Self.frameKey) {
@@ -147,7 +154,7 @@ final class SubtitleView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     override var isFlipped: Bool { true }
-    override var mouseDownCanMoveWindow: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
 
     func update(rows: [Row], stamp: UInt64? = nil) {
         self.rows = rows
@@ -275,14 +282,118 @@ final class SubtitleView: NSView {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let tracking { removeTrackingArea(tracking) }
-        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect], owner: self)
         addTrackingArea(area)
         tracking = area
     }
 
     var hoverChanged: ((Bool) -> Void)?
     override func mouseEntered(with event: NSEvent) { hoverChanged?(true) }
-    override func mouseExited(with event: NSEvent) { hoverChanged?(false) }
+    override func mouseExited(with event: NSEvent) {
+        hoverChanged?(false)
+        if dragZone == nil { NSCursor.arrow.set() }
+    }
+
+    // MARK: Moving and resizing by hand
+    //
+    // Drag the middle to move. Drag the top or bottom edge to change the height, which resizes
+    // the text to fit; drag the left or right edge to change the width (how soon lines wrap).
+
+    /// Which part of the window a point is over.
+    struct Zone: OptionSet {
+        let rawValue: Int
+        static let top = Zone(rawValue: 1), bottom = Zone(rawValue: 2), left = Zone(rawValue: 4), right = Zone(rawValue: 8)
+        /// No edge: the middle, which moves the window.
+        static let middle: Zone = []
+    }
+
+    /// Thickness of the edge strips that resize.
+    static let edgeThickness: CGFloat = 12
+
+    func zone(at point: NSPoint) -> Zone {
+        var z: Zone = []
+        let t = Self.edgeThickness
+        // The view is flipped: y grows downward.
+        if point.y <= t { z.insert(.top) } else if point.y >= bounds.height - t { z.insert(.bottom) }
+        if point.x <= t { z.insert(.left) } else if point.x >= bounds.width - t { z.insert(.right) }
+        return z
+    }
+
+    /// The window frame after dragging `zone` by (dx, dy) in screen coordinates (y up).
+    static func resized(_ start: NSRect, zone: Zone, dx: CGFloat, dy: CGFloat, min: NSSize, max: NSSize) -> NSRect {
+        var f = start
+        if zone.contains(.right) { f.size.width = Swift.min(Swift.max(start.width + dx, min.width), max.width) }
+        if zone.contains(.left) {
+            f.size.width = Swift.min(Swift.max(start.width - dx, min.width), max.width)
+            f.origin.x = start.maxX - f.width
+        }
+        if zone.contains(.top) { f.size.height = Swift.min(Swift.max(start.height + dy, min.height), max.height) }
+        if zone.contains(.bottom) {
+            f.size.height = Swift.min(Swift.max(start.height - dy, min.height), max.height)
+            f.origin.y = start.maxY - f.height
+        }
+        return f
+    }
+
+    /// Asked to apply a new frame while an edge is dragged, and told when the drag ends.
+    var onResize: ((NSRect) -> Void)?
+    var onResizeEnded: (() -> Void)?
+    var sizeLimits: (() -> (min: NSSize, max: NSSize))?
+
+    private var dragZone: Zone?
+    private var dragStartMouse = NSPoint.zero
+    private var dragStartFrame = NSRect.zero
+
+    override func mouseDown(with event: NSEvent) {
+        let z = zone(at: convert(event.locationInWindow, from: nil))
+        guard z != .middle, let window else {
+            self.window?.performDrag(with: event)
+            return
+        }
+        dragZone = z
+        dragStartMouse = NSEvent.mouseLocation
+        dragStartFrame = window.frame
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let z = dragZone else { return }
+        let now = NSEvent.mouseLocation
+        dragEdge(z, dx: now.x - dragStartMouse.x, dy: now.y - dragStartMouse.y)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard dragZone != nil else { return }
+        dragZone = nil
+        onResizeEnded?()
+    }
+
+    private func dragEdge(_ z: Zone, dx: CGFloat, dy: CGFloat) {
+        let limits = sizeLimits?() ?? (min: NSSize(width: 320, height: 60), max: NSSize(width: 10_000, height: 1_000))
+        onResize?(Self.resized(dragStartFrame, zone: z, dx: dx, dy: dy, min: limits.min, max: limits.max))
+    }
+
+    /// Performs an edge drag in code, exactly as the mouse would (used by the self-test).
+    func simulateDrag(_ z: Zone, dx: CGFloat, dy: CGFloat) {
+        guard let window else { return }
+        dragStartFrame = window.frame
+        dragEdge(z, dx: dx / 2, dy: dy / 2)
+        dragEdge(z, dx: dx, dy: dy)
+        onResizeEnded?()
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard dragZone == nil else { return }
+        let z = zone(at: convert(event.locationInWindow, from: nil))
+        if z == .middle {
+            NSCursor.openHand.set()
+        } else if z.isSubset(of: [.top, .bottom]) {
+            NSCursor.resizeUpDown.set()
+        } else if z.isSubset(of: [.left, .right]) {
+            NSCursor.resizeLeftRight.set()
+        } else {
+            NSCursor.crosshair.set()
+        }
+    }
 
     /// PNG of the current contents over a mid-gray backdrop (used for automated visual checks).
     func snapshotPNG() -> Data? {

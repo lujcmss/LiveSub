@@ -56,6 +56,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isHovering = false
     private var isRepositioning = false
     private var isResizing = false
+    private var resizeStartHeight: CGFloat = 0
     private var snapshotIndex = 0
     private var lastSnapshot = ""
 
@@ -123,7 +124,17 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Dragging the window taller or shorter resizes the text to fit it.
         panel.onLiveResize = { [weak self] size in
             guard let self else { return }
-            self.isResizing = true
+            if !self.isResizing {
+                self.isResizing = true
+                self.resizeStartHeight = OverlayPanel.height(for: self.config.style)
+            }
+            // A sideways drag changes only the width: leave the text size alone.
+            guard abs(size.height - self.resizeStartHeight) >= 1 else {
+                self.window.reset()
+                self.replayRows = []
+                self.render(stamp: nil)
+                return
+            }
             let fitted = OverlayPanel.fontSize(forHeight: size.height, style: self.config.style)
             guard fitted != self.config.style.fontSize else { return }
             self.config.style.fontSize = fitted
@@ -207,6 +218,23 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         panel.orderFrontRegardless()
+        if ProcessInfo.processInfo.environment["LIVESUB_TEST_RESIZE"] != nil {
+            // Self-test: drag edges in code and report what happens to the window and the text.
+            Task {
+                @MainActor func report(_ what: String) {
+                    print(String(format: "resize test: %@ → frame %@, font %.0f pt (settings %.0f pt)", what, NSStringFromRect(self.panel.frame), self.config.style.fontSize, self.settings.fontSize))
+                }
+                let view = self.panel.subtitleView!
+                try? await Task.sleep(for: .seconds(1))
+                report("start")
+                for (name, zone, dx, dy) in [("top edge up 70", SubtitleView.Zone.top, 0.0, 70.0), ("bottom edge up 50", .bottom, 0, 50),
+                                             ("right edge left 200", .right, -200, 0), ("top-left corner out", [.top, .left], -100, 40)] {
+                    view.simulateDrag(zone, dx: dx, dy: dy)
+                    try? await Task.sleep(for: .milliseconds(300))
+                    report(name)
+                }
+            }
+        }
         Log.debug("overlay frame \(NSStringFromRect(panel.frame)), level \(panel.level.rawValue), behavior \(panel.collectionBehavior.rawValue), visible \(panel.isVisible), clickThrough \(panel.clickThrough), screen \(NSStringFromRect(NSScreen.main?.frame ?? .zero))")
         buildStatusItem()
         start()
