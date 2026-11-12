@@ -217,3 +217,10 @@ System Audio Recording permission. A build you keep using only asks once.
 
 Measured on this Mac (48 kHz output, 100 ms chunks): tap→callback 32 ms, resample+chunk work
 0.2 ms, newest sample is ~27 ms old (p95 32 ms) when a chunk is ready for the recognizer.
+
+## License
+
+LiveSub is released under the [PolyForm Noncommercial License 1.0.0](LICENSE.md): you may use,
+modify and share it for any noncommercial purpose; commercial use is not permitted. The software
+is provided as is, without any warranty, and the author is not liable for any damages arising
+from it.
