@@ -70,10 +70,14 @@ final class ReplayController {
     private func stateChanged(_ state: SessionMatcher.State) {
         switch state {
         case .searching:
+            frozenTentative = nil
             print(String(format: "replay: lost sync, back to live subtitles (last match quality %.2f)", sync?.diagnostics.lockedErrorRate ?? 1))
         case let .locked(id, delta):
             lastShownStart = -1
-            if id == recordingID { onRewind?() }
+            if id == recordingID {
+                frozenTentative = tentative
+                onRewind?()
+            }
             let heard = sync?.recording().seconds ?? 0
             Log.debug(String(format: "replay: lock quality %.2f (0 = identical, 0.5 = unrelated, limit 0.30)", sync?.diagnostics.lockedErrorRate ?? 1))
             print(String(format: "replay: in sync with saved session %@ (offset %.2f s) after %.1f s of audio", String(id.prefix(8)), Double(delta) * AudioFingerprinter.hopSeconds, heard))
@@ -118,14 +122,25 @@ final class ReplayController {
 
     /// Looks up the translation of a sentence from the current run (set by the app).
     var translations: (String) -> String? = { _ in nil }
-    private var currentSnapshot: (count: Int, session: SubtitleSession)?
+    private var currentSnapshot: (count: Int, version: Int, frozen: [SubtitleSession.Caption], session: SubtitleSession)?
+    /// Tentative sentences as they were when the viewer skipped back (while a replay runs, the
+    /// recognizer's tentative text is about the replayed audio and must not be mixed in).
+    private var frozenTentative: [SubtitleSession.Caption]?
 
     /// The run in progress as a session, for replaying after the viewer skips back.
     private func currentSession() -> SubtitleSession? {
-        if let snapshot = currentSnapshot, snapshot.count == captions.count { return snapshot.session }
+        let extra = frozenTentative ?? tentative
+        if let snapshot = currentSnapshot, snapshot.count == captions.count, snapshot.frozen == extra { return snapshot.session }
+        let final = timedCaptions()
+        let lastFinal = final.last?.end ?? -1
+        // Tentative sentences only fill in after the last committed one; look up translations
+        // that have arrived for them.
+        let pending = extra.filter { $0.start >= lastFinal - 0.2 }.map { c in
+            SubtitleSession.Caption(start: c.start, end: c.end, source: c.source, translation: translations(c.source))
+        }
         let session = SubtitleSession(id: recordingID, title: sourceName, createdAt: recordingStarted, sourceLanguage: language,
-                                      targetLanguage: target, duration: 0, captions: timedCaptions(), fingerprints: [])
-        currentSnapshot = (captions.count, session)
+                                      targetLanguage: target, duration: 0, captions: final + pending, fingerprints: [])
+        currentSnapshot = (captions.count, tentativeVersion, extra, session)
         return session
     }
 
@@ -136,16 +151,39 @@ final class ReplayController {
         }
     }
 
+    /// Sentences from text the recognizer has not committed yet, with its rough timing. They
+    /// are never written to disk (the final text replaces them), but they let a viewer who
+    /// skips back see the last few seconds straight away.
+    private var tentative: [SubtitleSession.Caption] = []
+    private var tentativeVersion = 0
+
+    func setTentative(text: String, runs: [ASRResult.TimedRun]) {
+        var scratch = CaptionTimeline()
+        var sentences = scratch.finalize(text, runs: runs)
+        if let tail = scratch.flush() { sentences.append(tail) }
+        let lastFinal = captions.last?.end ?? -1
+        tentative = sentences.compactMap { c in
+            guard let start = c.start, let end = c.end, start >= lastFinal - 0.2,
+                  let sync, !sync.wasReplay(at: start) else { return nil }
+            return .init(start: start, end: max(end, start), source: c.source, translation: nil)
+        }
+        tentativeVersion += 1
+    }
+
     // MARK: Saving
 
     func record(_ new: [CaptionTimeline.Caption]) {
         // Sentences heard while replaying are already saved (and may be garbled at the point
         // where playback jumped): don't save them a second time.
-        captions.append(contentsOf: new.filter { c in
-            guard let sync, let start = c.start, let end = c.end else { return true }
+        captions.append(contentsOf: new.compactMap { c in
+            guard let sync, let start = c.start, let end = c.end else { return c }
             // A scrap of a word or two right after a replay is the tail of a cut-off sentence.
-            if c.source.count <= 3, sync.replayEnded(shortlyBefore: start) { return false }
-            return !sync.wasReplay(at: start) && !sync.wasReplay(at: (start + end) / 2)
+            if c.source.count <= 3, sync.replayEnded(shortlyBefore: start) { return nil }
+            // A sentence that began before the viewer skipped back is kept, ending at the jump.
+            guard let newEnd = sync.newPortion(start: start, end: end) else { return nil }
+            var kept = c
+            kept.end = newEnd
+            return kept
         })
     }
 
@@ -161,9 +199,11 @@ final class ReplayController {
         let formatter = DateFormatter()
         formatter.dateStyle = .medium
         formatter.timeStyle = .short
+        // Cut out what was a replay, so the saved session follows the video without gaps.
         let session = SubtitleSession(id: recordingID, title: "\(sourceName) · \(formatter.string(from: recordingStarted))",
                                       createdAt: recordingStarted, sourceLanguage: language, targetLanguage: target,
                                       duration: recording.seconds, captions: timed, fingerprints: recording.fingerprints)
+            .removing(sync.replayedIntervals())
         do {
             try store.save(session)
             return session

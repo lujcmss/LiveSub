@@ -57,6 +57,19 @@ public final class CaptionEngine {
         schedule()
     }
 
+    /// The speaker has paused mid-"sentence" (the recognizer has not closed it and will not
+    /// until it hears more). Treat what is there as a finished sentence: translate and show it.
+    /// If the sentence does continue, its text changes and it is handled afresh.
+    public func handleIdle() {
+        guard let last = timeline.displayUnits.last, !Self.isComplete(last) else { return }
+        heldComplete = last
+        if firstSeenComplete[last] == nil { firstSeenComplete[last] = HostClock.now() }
+        requestTranslation(last)
+    }
+
+    /// Text of the unfinished sentence that a pause promoted to "finished".
+    private var heldComplete: String?
+
     /// - Returns: the sentences this completed, with their timing when `runs` are given.
     @discardableResult
     public func handleFinal(_ text: String, runs: [ASRResult.TimedRun] = []) -> [CaptionTimeline.Caption] {
@@ -80,6 +93,7 @@ public final class CaptionEngine {
         timeline.clearScreen()
         eagerSource = nil
         eagerText = nil
+        heldComplete = nil
     }
 
     // MARK: Output
@@ -87,9 +101,14 @@ public final class CaptionEngine {
     public var rows: [Row] {
         let units = timeline.displayUnits
         return units.enumerated().map { index, source in
-            let complete = Self.isComplete(source) || index < timeline.visibleCaptions.count
+            let complete = Self.isComplete(source) || index < timeline.visibleCaptions.count || source == heldComplete
             if let t = cache[source] {
                 return Row(source: source, translation: t, isProvisional: false, isComplete: complete)
+            }
+            // The sentence went on after a pause: keep the translation of its first part
+            // (marked provisional) until the whole of it is translated.
+            if index == units.count - 1, let held = heldComplete, source.hasPrefix(held), let t = cache[held] {
+                return Row(source: source, translation: t, isProvisional: true, isComplete: false)
             }
             // Unfinished last sentence: show the eager translation if it is for a prefix of it.
             if eagerTranslation, index == units.count - 1, let eagerSource, let eagerText, source.hasPrefix(eagerSource) || eagerSource.hasPrefix(source) {

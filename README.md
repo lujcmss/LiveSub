@@ -123,20 +123,28 @@ after seeks. Measured:
 | Saved subtitle on screen relative to the start of its speech | 85 ms early (p95 60 ms early) |
 | Pause for 3 s (silence or no audio at all), then resume | stays in sync |
 
-## Skipping back
+## Skipping back, and long pauses
 
 The session being watched is matched against itself too: audio becomes findable about 5 s
 after it was heard. Skip back 10 seconds and LiveSub recognizes the stretch about a second
-later, commits whatever the recognizer still held as tentative, and shows the saved sentences
-and translations on time. Text heard during a replay is not saved twice, and a recognizer
-result that runs across the jump is trimmed to its new words. Measured on a recording
-(skip back 9 s): back in sync 1.0 s after the jump; saved subtitle 80 ms early.
+later and shows its sentences and translations on time. For the last few seconds, which the
+recognizer has not committed yet, it uses the tentative text (never written to disk; the final
+text replaces it). Words heard during a replay are not saved twice, a sentence that began
+before the jump is kept up to the jump, and replayed stretches are cut out of the saved session
+so it follows the video's own timeline. Measured on a recording (skip back 9 s): back in sync
+1.0 s after the jump; subtitles 70-95 ms early.
 
-To keep saved text fresh, the pipeline asks the recognizer to commit after 9 s without a final
-result. Committing at every pause is available as a setting ("Finish sentences at pauses"):
-it marks sentences complete about 0.45 s sooner and shows translations about 0.3 s sooner, but
-the recognizer loses its look-ahead and context, which cost a correctly heard word on the test
-recording, so it is off by default.
+**Long pauses.** The recognizer only closes a sentence when it hears what comes next: with a
+4 s pause it held the sentence for 3.7 s. LiveSub now treats the sentence as finished, and
+translates it, once the audio has been quiet for 0.7 s and the text has stopped changing for
+0.3 s (text alone for 1.5 s when music keeps the audio from going quiet). On the test clip that
+is 0.8 s after the last word instead of 3.2 s.
+
+**Why the recognizer is never forced.** `SpeechAnalyzer.finalize(through:)` would do both jobs,
+but it gives up the recognizer's look-ahead and damages the text: on test clips sentence endings
+were lost ("行きませんか" became "行きます") and a correctly heard word turned wrong. It remains
+available only as the opt-in "Finish sentences at pauses" setting (sentences complete about
+0.45 s sooner, translations about 0.3 s sooner).
 
 ## Translation
 

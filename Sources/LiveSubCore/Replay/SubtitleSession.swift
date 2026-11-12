@@ -76,6 +76,39 @@ public struct SubtitleSession: Codable, Sendable, Identifiable {
         try c.encode(data, forKey: .fingerprints)
     }
 
+    /// The session with the given stretches cut out and everything after them moved earlier.
+    /// Used to drop replayed audio (the viewer skipped back) so that the saved session follows
+    /// the video's own timeline without gaps.
+    public func removing(_ intervals: [ClosedRange<Double>], hopSeconds: Double = AudioFingerprinter.hopSeconds) -> SubtitleSession {
+        let cuts = intervals.filter { $0.upperBound > $0.lowerBound }.sorted { $0.lowerBound < $1.lowerBound }
+        guard !cuts.isEmpty else { return self }
+        /// Seconds removed before `time`.
+        func removed(before time: Double) -> Double {
+            cuts.reduce(0) { $0 + max(0, min(time, $1.upperBound) - $1.lowerBound) }
+        }
+        var out = self
+        out.captions = captions.compactMap { c in
+            guard !cuts.contains(where: { $0.contains(c.start) && $0.upperBound > c.start }) else { return nil }
+            var moved = c
+            moved.start = c.start - removed(before: c.start)
+            moved.end = max(moved.start, c.end - removed(before: c.end))
+            return moved
+        }
+        var kept: [UInt32] = []
+        kept.reserveCapacity(fingerprints.count)
+        var next = 0
+        for cut in cuts {
+            let from = min(fingerprints.count, max(next, Int((cut.lowerBound / hopSeconds).rounded())))
+            let to = min(fingerprints.count, max(from, Int((cut.upperBound / hopSeconds).rounded())))
+            kept.append(contentsOf: fingerprints[next..<from])
+            next = to
+        }
+        kept.append(contentsOf: fingerprints[next...])
+        out.fingerprints = kept
+        out.duration = max(0, duration - removed(before: duration))
+        return out
+    }
+
     /// Captions to show at `time`, appearing `lead` seconds early. A caption stays until
     /// `linger` seconds after it ends; consecutive captions closer than `linger` stay together
     /// (the overlay then keeps as many of them as fit).

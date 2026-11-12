@@ -492,3 +492,26 @@ private func fin(_ t: String, _ a: Double, _ b: Double) -> ASRResult { ASRResult
         #expect(m.state == .searching)
     }
 }
+
+@Suite struct SessionCompactionTests {
+    @Test func replayedStretchIsCutOutAndLaterCaptionsMoveEarlier() {
+        let hop = AudioFingerprinter.hopSeconds
+        // 30 s of audio; seconds 10-19 were a replay (the viewer skipped back).
+        let frames = (0..<Int(30 / hop)).map { UInt32($0 + 1) }
+        let session = SubtitleSession(title: "t", sourceLanguage: "ja-JP", targetLanguage: nil, duration: 30, captions: [
+            .init(start: 2, end: 4, source: "before", translation: nil),
+            .init(start: 8, end: 10, source: "up to the jump", translation: nil),
+            .init(start: 12, end: 14, source: "heard again", translation: nil),
+            .init(start: 20, end: 22, source: "after", translation: nil),
+        ], fingerprints: frames)
+        let cut = session.removing([10...19])
+        #expect(cut.captions.map(\.source) == ["before", "up to the jump", "after"])
+        #expect(cut.captions[2].start == 11 && cut.captions[2].end == 13)
+        #expect(abs(cut.duration - 21) < 1e-9)
+        #expect(cut.fingerprints.count == frames.count - Int((9 / hop).rounded()))
+        // The frame right after the cut is the one that followed the replay.
+        #expect(cut.fingerprints[Int((10 / hop).rounded())] == frames[Int((19 / hop).rounded())])
+        // Nothing to cut: unchanged.
+        #expect(session.removing([]).captions == session.captions)
+    }
+}

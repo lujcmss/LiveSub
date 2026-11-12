@@ -142,6 +142,28 @@ public final class ReplaySync: @unchecked Sendable {
         return replayIntervals.contains { $0.contains(streamSeconds) }
     }
 
+    /// The part of `start...end` that was heard before any replay began inside it: nil if it
+    /// starts inside a replay, otherwise its end (pulled back to where a replay started).
+    public func newPortion(start: Double, end: Double) -> Double? {
+        lock.lock(); defer { lock.unlock() }
+        var intervals = replayIntervals
+        if let open = replayStart { intervals.append(open...Double.greatestFiniteMagnitude) }
+        var clamped = end
+        for interval in intervals {
+            if interval.contains(start) { return nil }
+            if interval.lowerBound > start, interval.lowerBound < clamped { clamped = interval.lowerBound }
+        }
+        return clamped
+    }
+
+    /// Stretches of this run (stream seconds) that were replays of something already saved.
+    public func replayedIntervals() -> [ClosedRange<Double>] {
+        lock.lock(); defer { lock.unlock() }
+        var intervals = replayIntervals
+        if let open = replayStart { intervals.append(open...(Double(recorded.count) * AudioFingerprinter.hopSeconds)) }
+        return intervals
+    }
+
     /// Whether a replay ended within `window` seconds before `streamSeconds` (the first words
     /// after a replay are usually the cut-off tail of a sentence).
     public func replayEnded(shortlyBefore streamSeconds: Double, within window: Double = 1.5) -> Bool {

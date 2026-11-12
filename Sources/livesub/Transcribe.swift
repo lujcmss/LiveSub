@@ -36,7 +36,7 @@ final class ConsoleRenderer: @unchecked Sendable {
             line("Downloading speech model… \(Int(p * 100))%")
         case let .ready(recognizer, format):
             line("Ready: \(recognizer), \(format). Listening…\n")
-        case let .partial(text, latency, _):
+        case let .partial(text, _, latency, _):
             guard showPartials, !text.isEmpty else { return }
             let tag = latency.map { String(format: " (%.0f ms)", $0) } ?? ""
             if isTTY {
@@ -52,7 +52,7 @@ final class ConsoleRenderer: @unchecked Sendable {
             clearPartial()
             let tag = latency.map { String(format: "  [final %.0f ms after last word]", $0) } ?? ""
             print("✓ \(text)\(isTTY ? "\u{1B}[2m\(tag)\u{1B}[0m" : tag)")
-        case .sentence, .sentenceBreak:
+        case .sentence, .sentenceBreak, .idle:
             break
         }
     }

@@ -9,7 +9,11 @@ public final class TranscriptionPipeline: @unchecked Sendable {
         /// The recognizer is loaded and audio is flowing.
         case ready(recognizer: String, format: String)
         /// The not-yet-final tail changed. `latencyMS`: age of its newest word.
-        case partial(text: String, latencyMS: Double?, receivedHostTime: UInt64)
+        case partial(text: String, runs: [ASRResult.TimedRun], latencyMS: Double?, receivedHostTime: UInt64)
+        /// The unfinished text has not changed for a while: the speaker has paused. The
+        /// recognizer will not close the sentence until it hears more, so treat it as finished
+        /// for now (it may still be revised when speech resumes).
+        case idle
         /// A stretch of speech was finalized. `latencyMS`: age of its last word.
         case final(text: String, runs: [ASRResult.TimedRun], latencyMS: Double?, receivedHostTime: UInt64)
         /// A complete sentence is available (what translation will consume).
@@ -42,8 +46,11 @@ public final class TranscriptionPipeline: @unchecked Sendable {
     private var sawAudio = false
     /// In continuous dialogue the recognizer can hold text as "not final" for 10-15 s. Final
     /// text is what gets saved (with accurate timing) for replay, so that is too stale for a
-    /// viewer who skips back a few seconds: after `commitLimit` seconds uncommitted, the
-    /// pipeline asks for a commit.
+    /// viewer who skips back a few seconds. Forcing the recognizer to commit
+    /// (`finalize(through:)`) fixes that but damages the text: it drops its look-ahead, and on
+    /// test clips sentence endings were lost ("行きませんか" became "行きます"). So by default
+    /// nothing is forced (`commitLimit` is infinite); skip-back uses the tentative text instead
+    /// (see `ReplayController`), and a long pause is reported as `.idle` rather than committed.
     ///
     /// `commitAtPauses` goes further and commits at every pause in speech (once `commitAfter`
     /// seconds are pending), ending the sentence there. Measured on recordings this marks
@@ -53,7 +60,7 @@ public final class TranscriptionPipeline: @unchecked Sendable {
     /// recording that turned a correctly heard word into a wrong one. Off by default.
     public var commitAtPauses = false
     public var commitAfter: Double = 1.5
-    public var commitLimit: Double = 9
+    public var commitLimit: Double = .infinity
     /// Stream times of commits that should also end the sentence in progress.
     private var pendingBreaks: [Double] = []
     private var pauses = PauseDetector()
@@ -70,6 +77,55 @@ public final class TranscriptionPipeline: @unchecked Sendable {
         if endsSentence { pendingBreaks.append(committedThrough) }
         commitLock.unlock()
         backend.finalizePending(secondsBack: secondsBack)
+    }
+
+    /// An unfinished sentence is closed when the audio has gone quiet for `idleQuietSeconds`
+    /// and the text has stopped changing for `idleTextSeconds` (text trails the audio by
+    /// ~0.6 s, and partial results can stall mid-sentence, so neither sign is enough alone).
+    /// With music under the speech the audio never goes quiet; then the text alone decides,
+    /// after `idleTextOnlySeconds`.
+    public var idleQuietSeconds: Double = 0.7
+    public var idleTextSeconds: Double = 0.3
+    public var idleTextOnlySeconds: Double = 1.5
+    /// How long the audio has currently been quiet (seconds); written on the audio queue.
+    private var quietFor: Double = 0
+    private var openVolatile = false
+    private var openPending = false
+    private var openSince: UInt64 = 0
+    private var idleHandled = true
+    private var idleBreakPending = false
+
+    private enum IdleAction { case none, commit, breakOnly }
+
+    /// Called from the results loop whenever the unfinished text changes.
+    private func noteOpenText(volatile: Bool, pending: Bool) {
+        commitLock.lock()
+        openVolatile = volatile
+        openPending = pending
+        openSince = HostClock.now()
+        idleHandled = !(volatile || pending)
+        commitLock.unlock()
+    }
+
+    /// What the idle watcher should do now.
+    private func idleAction() -> IdleAction {
+        commitLock.lock(); defer { commitLock.unlock() }
+        guard !idleHandled else { return .none }
+        let textIdle = HostClock.ms(from: openSince, to: HostClock.now()) / 1000
+        guard (quietFor >= idleQuietSeconds && textIdle >= idleTextSeconds) || textIdle >= idleTextOnlySeconds else { return .none }
+        idleHandled = true
+        if openVolatile { return .commit }
+        // Only already-final text is waiting for its sentence end: no result will come, so
+        // announce the break directly (the loop tidies its own segmenter on the next result).
+        idleBreakPending = true
+        return .breakOnly
+    }
+
+    private func takeIdleBreak() -> Bool {
+        commitLock.lock(); defer { commitLock.unlock() }
+        let pending = idleBreakPending
+        idleBreakPending = false
+        return pending
     }
 
     /// Whether a final result ending at `audioEnd` reaches a commit that ends a sentence.
@@ -118,6 +174,20 @@ public final class TranscriptionPipeline: @unchecked Sendable {
         var assembler = TranscriptAssembler()
         var segmenter = SentenceSegmenter()
         var words = WordLatencyTracker()
+        // The recognizer only closes a sentence when it hears what comes next. If nothing
+        // comes (a long pause), close it ourselves once the text has stopped changing.
+        let idleWatcher = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(100))
+                guard let self else { return }
+                switch self.idleAction() {
+                case .commit: onEvent(.idle)
+                case .breakOnly: onEvent(.sentenceBreak)
+                case .none: break
+                }
+            }
+        }
+        defer { idleWatcher.cancel() }
         for try await r in results {
             let spokenAt = timeline.hostTime(at: r.newestWordEnd ?? r.audioEnd)
             let latency = spokenAt.map { HostClock.ms(from: $0, to: r.receivedHostTime) }
@@ -127,8 +197,11 @@ public final class TranscriptionPipeline: @unchecked Sendable {
             case .volatileUpdated:
                 if let latency, !assembler.volatileText.isEmpty { stats.record(Stage.partial, ms: latency) }
                 words.sawPartial(assembler.volatileText, at: r.receivedHostTime)
-                onEvent(.partial(text: assembler.volatileText, latencyMS: latency, receivedHostTime: r.receivedHostTime))
+                noteOpenText(volatile: !assembler.volatileText.isEmpty, pending: !segmenter.pending.isEmpty)
+                onEvent(.partial(text: assembler.volatileText, runs: r.timedRuns, latencyMS: latency, receivedHostTime: r.receivedHostTime))
             case let .finalized(segment):
+                // A break announced by the idle watcher happened before this text.
+                if takeIdleBreak() { _ = segmenter.flush() }
                 noteCommitted(through: r.audioEnd)
                 if let latency { stats.record(Stage.final, ms: latency) }
                 for ms in words.finalized(runs: r.timedRuns, at: r.receivedHostTime, captureTime: { self.timeline.hostTime(at: $0) }) {
@@ -143,6 +216,7 @@ public final class TranscriptionPipeline: @unchecked Sendable {
                     if let tail = segmenter.flush() { onEvent(.sentence(tail)) }
                     onEvent(.sentenceBreak)
                 }
+                noteOpenText(volatile: !assembler.volatileText.isEmpty, pending: !segmenter.pending.isEmpty)
                 assembler.trim(keepingLast: 120)
             }
         }
@@ -161,6 +235,7 @@ public final class TranscriptionPipeline: @unchecked Sendable {
             backend.feed(chunk.buffer)
             let paused = pauses.note(levelDB: chunk.levelDB, duration: duration)
             commitLock.lock()
+            quietFor = pauses.quietSeconds
             let uncommitted = timeline.secondsFed - committedThrough
             commitLock.unlock()
             if commitAtPauses, paused, uncommitted >= commitAfter {
@@ -193,6 +268,8 @@ public struct PauseDetector: Sendable {
 
     private var peak: Float = -160
     private var quiet = 0.0
+    /// How long the level has currently been below the pause threshold.
+    public var quietSeconds: Double { quiet }
     private var speech = 0.0
     private var reported = false
 

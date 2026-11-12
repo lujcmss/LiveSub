@@ -167,10 +167,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         replay = ReplayController(saveEnabled: config.saveSessions, lead: config.replayLead,
                                   linger: config.idleSeconds, stats: stats)
         // Commit what was heard before the jump (recognizing the jump takes about a second).
-        replay.onRewind = { [weak self] in
-            guard let self else { return }
-            self.pipeline?.commitNow(secondsBack: (self.replay.sync?.secondsSinceReplayBegan ?? 1.0) + 0.4, endsSentence: true)
-        }
+        // (No forced commit on skip-back: the tentative text covers the last few seconds, and
+        // forcing the recognizer damages the text.)
+        replay.onRewind = {}
         replay.onStatus = { [weak self] status in
             guard let self else { return }
             if let status {
@@ -470,7 +469,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             rebuildMenu()
             panel.subtitleView.showNotice("Listening to \(sourceName)…")
             scheduleIdleFade(after: 2.5)
-        case let .partial(text, _, received):
+        case .idle:
+            engine.handleIdle()
+            Log.debug(String(format: "pause: sentence closed at %.2f s of audio: %@", pipeline?.timeline.secondsFed ?? 0, engine.rows.last?.source ?? ""))
+            render(stamp: nil)
+        case let .partial(text, runs, _, received):
+            replay.setTentative(text: text, runs: runs)
             engine.handlePartial(text)
             render(stamp: received)
         case let .final(fullText, allRuns, latency, received):
