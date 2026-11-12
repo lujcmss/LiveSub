@@ -59,12 +59,15 @@ Only. Simplified and Traditional Chinese are separate targets.
 - **Model downloads** are one-time and must go through Apple's own confirmation dialog;
   LiveSub opens a small window explaining it when a pair is missing. To pre-download:
   `open -n build/LiveSub.app --args translation-setup --lang ja-JP,ko-KR --to en,zh-Hans,zh-Hant`.
-  Installed here: Japanese and Korean → English and Simplified Chinese.
+  Tested: Japanese, Korean, Spanish and French into English and Simplified Chinese.
 - **No waiting for finals.** A sentence is translated the moment its closing punctuation
   appears in the partial text, and the sentence still being spoken gets a dimmed provisional
   translation that refreshes as it grows. A revised sentence is simply translated again.
 
-Measured on the Japanese recording (Korean is the same within a few ms):
+macOS lets an app keep only 5 speech languages reserved for offline use; `livesub languages`
+shows which are kept, and LiveSub releases the least recently used one when a sixth is needed.
+
+Measured on a Japanese recording (Korean, Spanish and French are within ~20 ms of this):
 
 | Stage | p50 | p95 |
 |---|---|---|
