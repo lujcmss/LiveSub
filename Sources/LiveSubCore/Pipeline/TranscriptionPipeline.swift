@@ -11,7 +11,7 @@ public final class TranscriptionPipeline: @unchecked Sendable {
         /// The not-yet-final tail changed. `latencyMS`: age of its newest word.
         case partial(text: String, latencyMS: Double?, receivedHostTime: UInt64)
         /// A stretch of speech was finalized. `latencyMS`: age of its last word.
-        case final(text: String, latencyMS: Double?, receivedHostTime: UInt64)
+        case final(text: String, runs: [ASRResult.TimedRun], latencyMS: Double?, receivedHostTime: UInt64)
         /// A complete sentence is available (what translation will consume).
         case sentence(String)
     }
@@ -37,6 +37,8 @@ public final class TranscriptionPipeline: @unchecked Sendable {
     /// Audio that arrives while the recognizer is still starting is fed once it is ready.
     private var accepting = false
     private var sawAudio = false
+    /// Called on the audio queue with every chunk fed to the recognizer (set before `run`).
+    public var onChunk: (@Sendable (AudioChunk) -> Void)?
 
     public init(source: AudioSource, backend: ASRBackend, chunkDuration: Double = 0.1, stats: LatencyStats = LatencyStats()) {
         self.source = source
@@ -86,7 +88,7 @@ public final class TranscriptionPipeline: @unchecked Sendable {
                 if let start = timeline.hostTime(at: r.audioStart) {
                     stats.record(Stage.finalFromStart, ms: HostClock.ms(from: start, to: r.receivedHostTime))
                 }
-                onEvent(.final(text: segment.text, latencyMS: latency, receivedHostTime: r.receivedHostTime))
+                onEvent(.final(text: segment.text, runs: r.timedRuns, latencyMS: latency, receivedHostTime: r.receivedHostTime))
                 for s in segmenter.append(segment.text) { onEvent(.sentence(s)) }
                 assembler.trim(keepingLast: 120)
             }
@@ -104,6 +106,7 @@ public final class TranscriptionPipeline: @unchecked Sendable {
             let duration = Double(chunk.buffer.frameLength) / chunk.buffer.format.sampleRate
             timeline.append(duration: duration, startHostTime: chunk.startHostTime)
             backend.feed(chunk.buffer)
+            onChunk?(chunk)
             stats.record(Stage.capture, ms: HostClock.ms(from: chunk.endHostTime, to: HostClock.now()))
         }
     }

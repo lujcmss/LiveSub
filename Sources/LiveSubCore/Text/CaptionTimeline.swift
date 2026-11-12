@@ -10,6 +10,9 @@ public struct CaptionTimeline: Sendable {
         public let id: Int
         public var source: String
         public var translation: String?
+        /// When the sentence was spoken (stream seconds), if the recognizer reported timing.
+        public var start: Double?
+        public var end: Double?
     }
 
     /// Completed sentences, oldest first (bounded history, used for display and copying).
@@ -22,6 +25,8 @@ public struct CaptionTimeline: Sendable {
     public var maxHistory = 200
 
     private var segmenter = SentenceSegmenter()
+    /// Timing of finalized text not yet assigned to a sentence: (non-whitespace characters, start, end).
+    private var timing: [(count: Int, start: Double, end: Double)] = []
     private var nextID = 1
     /// Captions with id below this were cleared from the screen (after a pause in speech).
     private var firstVisibleID = 1
@@ -30,11 +35,47 @@ public struct CaptionTimeline: Sendable {
 
     /// Add finalized text. Returns the sentences it completed.
     @discardableResult
-    public mutating func finalize(_ text: String) -> [Caption] {
+    public mutating func finalize(_ text: String, runs: [ASRResult.TimedRun] = []) -> [Caption] {
+        for run in runs {
+            let n = Self.inkCount(run.text)
+            if n > 0 { timing.append((n, run.start, run.end)) }
+        }
         var done: [Caption] = []
         for sentence in segmenter.append(text) { done.append(makeCaption(sentence)) }
         pendingFinal = segmenter.pending
+        // Nothing left over: realign so a counting slip can never accumulate.
+        if pendingFinal.isEmpty { timing.removeAll(keepingCapacity: true) }
         return done
+    }
+
+    /// Characters that are not whitespace: what sentences and timed runs have in common however
+    /// they were trimmed and joined.
+    static func inkCount(_ text: String) -> Int {
+        text.unicodeScalars.reduce(0) { $0 + (CharacterSet.whitespacesAndNewlines.contains($1) ? 0 : 1) }
+    }
+
+    /// Take the timing of the next `count` non-whitespace characters off the queue.
+    private mutating func consumeTiming(_ count: Int) -> (start: Double, end: Double)? {
+        var remaining = count
+        var start: Double?
+        var end: Double?
+        while remaining > 0, let head = timing.first {
+            if start == nil { start = head.start }
+            end = head.end
+            if head.count <= remaining {
+                remaining -= head.count
+                timing.removeFirst()
+            } else {
+                // The run continues into the next sentence: split it by character share.
+                let share = Double(remaining) / Double(head.count)
+                let cut = head.start + (head.end - head.start) * share
+                end = cut
+                timing[0] = (head.count - remaining, cut, head.end)
+                remaining = 0
+            }
+        }
+        guard let start, let end else { return nil }
+        return (start, end)
     }
 
     public mutating func setVolatile(_ text: String) {
@@ -95,7 +136,8 @@ public struct CaptionTimeline: Sendable {
     }
 
     private mutating func makeCaption(_ source: String) -> Caption {
-        let c = Caption(id: nextID, source: source, translation: nil)
+        let span = consumeTiming(Self.inkCount(source))
+        let c = Caption(id: nextID, source: source, translation: nil, start: span?.start, end: span?.end)
         nextID += 1
         captions.append(c)
         if captions.count > maxHistory { captions.removeFirst(captions.count - maxHistory) }

@@ -227,9 +227,15 @@ public final class AppleSpeechBackend: ASRBackend, @unchecked Sendable {
         var newest: Double?
         var runs: [ASRResult.TimedRun] = []
         for run in text.runs {
-            if let r = run.audioTimeRange, r.end.isNumeric {
+            let piece = String(text[run.range].characters)
+            if let r = run.audioTimeRange, r.start.isNumeric, r.end.isNumeric {
                 newest = max(newest ?? 0, r.end.seconds)
-                runs.append(.init(text: String(text[run.range].characters), end: r.end.seconds))
+                runs.append(.init(text: piece, start: r.start.seconds, end: r.end.seconds))
+            } else if let last = runs.last {
+                // Untimed text (spaces, some punctuation) belongs to the moment before it.
+                runs.append(.init(text: piece, start: last.end, end: last.end))
+            } else if range.start.isNumeric {
+                runs.append(.init(text: piece, start: range.start.seconds, end: range.start.seconds))
             }
         }
         return ASRResult(text: String(text.characters), isFinal: isFinal,

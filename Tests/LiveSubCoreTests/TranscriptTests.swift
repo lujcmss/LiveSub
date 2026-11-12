@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import LiveSubCore
 
@@ -256,5 +257,161 @@ private func fin(_ t: String, _ a: Double, _ b: Double) -> ASRResult { ASRResult
         w.reset()
         #expect(w.firstVisible(count: 1) { _ in true } == 0)
         #expect(w.firstVisible(count: 0) { _ in true } == 0)
+    }
+}
+
+@Suite struct CaptionTimingTests {
+    private func runs(_ pieces: [(String, Double, Double)]) -> [ASRResult.TimedRun] {
+        pieces.map { .init(text: $0.0, start: $0.1, end: $0.2) }
+    }
+
+    @Test func sentencesGetTheTimeOfTheirWords() {
+        var t = CaptionTimeline()
+        let done = t.finalize("Hello world. How are you?", runs: runs([
+            ("Hello ", 1.0, 1.4), ("world. ", 1.4, 1.9), ("How ", 2.5, 2.7), ("are ", 2.7, 2.8), ("you?", 2.8, 3.2),
+        ]))
+        #expect(done.map(\.source) == ["Hello world.", "How are you?"])
+        #expect(done[0].start == 1.0 && done[0].end == 1.9)
+        #expect(done[1].start == 2.5 && done[1].end == 3.2)
+    }
+
+    @Test func sentenceSpanningTwoFinalsKeepsItsStart() {
+        var t = CaptionTimeline()
+        #expect(t.finalize("I went to", runs: runs([("I ", 0.2, 0.3), ("went ", 0.3, 0.6), ("to", 0.6, 0.7)])).isEmpty)
+        let done = t.finalize("the station. Then", runs: runs([("the ", 5.0, 5.1), ("station. ", 5.1, 5.6), ("Then", 6.0, 6.3)]))
+        #expect(done.count == 1)
+        #expect(done[0].start == 0.2 && done[0].end == 5.6)
+        let tail = t.flush()
+        #expect(tail?.start == 6.0 && tail?.end == 6.3)
+    }
+
+    @Test func runStraddlingTwoSentencesIsSplit() {
+        var t = CaptionTimeline()
+        // No spaces in Japanese; one run covers the end of a sentence and the start of the next.
+        let done = t.finalize("晴れです。行こう。", runs: runs([("晴れで", 0, 0.6), ("す。行", 0.6, 1.2), ("こう。", 1.2, 1.8)]))
+        #expect(done.count == 2)
+        #expect(done[0].start == 0)
+        #expect(abs(done[0].end! - 1.0) < 1e-9)
+        #expect(abs(done[1].start! - 1.0) < 1e-9)
+        #expect(done[1].end == 1.8)
+    }
+
+    @Test func untimedFinalsHaveNoTimes() {
+        var t = CaptionTimeline()
+        #expect(t.finalize("No timing here.").first?.start == nil)
+    }
+}
+
+@Suite struct SubtitleSessionTests {
+    private let session = SubtitleSession(title: "t", sourceLanguage: "ja-JP", targetLanguage: "en", duration: 60, captions: [
+        .init(start: 1, end: 2, source: "A", translation: "a"),
+        .init(start: 3, end: 4, source: "B", translation: "b"),
+        .init(start: 20, end: 22, source: "C", translation: nil),
+    ], fingerprints: [0, 1, 0xFFFF_FFFF, 0xDEAD_BEEF])
+
+    @Test func captionsAppearOnTimeAndLingerTogether() {
+        #expect(session.captions(at: 0.5).isEmpty)
+        #expect(session.captions(at: 0.95, lead: 0.1).map(\.source) == ["A"])
+        #expect(session.captions(at: 3.5).map(\.source) == ["A", "B"])
+        // B is still lingering; C has not started.
+        #expect(session.captions(at: 8.9).map(\.source) == ["A", "B"])
+        #expect(session.captions(at: 9.5).isEmpty)
+        // C starts alone: the gap before it is longer than the linger time.
+        #expect(session.captions(at: 20.1).map(\.source) == ["C"])
+        #expect(session.captions(at: 30).isEmpty)
+    }
+
+    @Test func roundTripsThroughJSON() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("livesub-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = SessionStore(directory: dir)
+        try store.save(session)
+        let loaded = store.loadAll()
+        #expect(loaded.count == 1)
+        #expect(loaded[0].captions == session.captions)
+        #expect(loaded[0].fingerprints == session.fingerprints)
+        #expect(loaded[0].targetLanguage == "en")
+        try store.delete(id: session.id)
+        #expect(store.loadAll().isEmpty)
+    }
+}
+
+@Suite struct SessionMatcherTests {
+    /// Deterministic pseudo-random fingerprints (never the silent value).
+    private func noise(_ count: Int, seed: UInt64) -> [UInt32] {
+        var x = seed
+        return (0..<count).map { _ in
+            x = x &* 6364136223846793005 &+ 1442695040888963407
+            return UInt32(truncatingIfNeeded: x >> 32) | 1
+        }
+    }
+
+    /// Flip roughly `rate` of the bits, like re-encoded or re-aligned audio would.
+    private func corrupt(_ frames: [UInt32], rate: Double, seed: UInt64) -> [UInt32] {
+        var x = seed
+        return frames.map { f in
+            var out = f
+            for bit in 0..<32 {
+                x = x &* 6364136223846793005 &+ 1442695040888963407
+                if Double(x >> 40) / Double(1 << 24) < rate { out ^= 1 << UInt32(bit) }
+            }
+            return out == 0 ? 1 : out
+        }
+    }
+
+    @Test func locksOntoTheRightPlaceDespiteBitErrors() {
+        let saved = noise(5000, seed: 1)
+        var m = SessionMatcher(references: [.init(id: "a", fingerprints: saved), .init(id: "b", fingerprints: noise(5000, seed: 2))])
+        let live = corrupt(Array(saved[2000..<2400]), rate: 0.12, seed: 9)
+        m.append(live)
+        #expect(m.state == .locked(id: "a", delta: 2000))
+        #expect(m.position?.frame == 2400)
+    }
+
+    @Test func unknownAudioNeverLocks() {
+        var m = SessionMatcher(references: [.init(id: "a", fingerprints: noise(5000, seed: 1))])
+        m.append(noise(2000, seed: 77))
+        #expect(m.state == .searching)
+    }
+
+    @Test func seekRelocksElsewhere() {
+        let saved = noise(8000, seed: 3)
+        var m = SessionMatcher(references: [.init(id: "a", fingerprints: saved)])
+        m.append(Array(saved[1000..<1400]))
+        #expect(m.state == .locked(id: "a", delta: 1000))
+        // Jump to a different place: the lock is dropped and found again.
+        m.append(Array(saved[6000..<6500]))
+        #expect(m.position?.frame == 6500)
+    }
+
+    @Test func pauseFreezesAndResumeContinues() {
+        let saved = noise(8000, seed: 4)
+        var m = SessionMatcher(references: [.init(id: "a", fingerprints: saved)])
+        m.append(Array(saved[1000..<1400]))
+        // Playback pauses: silence arrives while the saved audio has sound.
+        m.append([UInt32](repeating: AudioFingerprinter.silent, count: 300))
+        #expect(m.state == .paused(id: "a", frame: 1400))
+        #expect(m.position?.frame == 1400)
+        // Resume from the same spot.
+        m.append(Array(saved[1400..<1700]))
+        #expect(m.position?.frame == 1700)
+        if case .locked = m.state {} else { Issue.record("expected locked after resume, got \(m.state)") }
+    }
+
+    @Test func silenceInTheSavedAudioIsNotAPause() {
+        var saved = noise(4000, seed: 5)
+        for i in 1500..<1800 { saved[i] = AudioFingerprinter.silent }
+        var m = SessionMatcher(references: [.init(id: "a", fingerprints: saved)])
+        m.append(Array(saved[1000..<2200]))
+        #expect(m.state == .locked(id: "a", delta: 1000))
+    }
+
+    @Test func lockIsDroppedAfterTheSessionEnds() {
+        let saved = noise(1000, seed: 6)
+        var m = SessionMatcher(references: [.init(id: "a", fingerprints: saved)])
+        m.append(Array(saved[500..<1000]))
+        #expect(m.state == .locked(id: "a", delta: 500))
+        m.append(noise(600, seed: 50))
+        #expect(m.state == .searching)
     }
 }

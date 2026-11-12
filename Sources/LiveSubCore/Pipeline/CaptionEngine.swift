@@ -57,12 +57,22 @@ public final class CaptionEngine {
         schedule()
     }
 
-    public func handleFinal(_ text: String) {
+    /// - Returns: the sentences this completed, with their timing when `runs` are given.
+    @discardableResult
+    public func handleFinal(_ text: String, runs: [ASRResult.TimedRun] = []) -> [CaptionTimeline.Caption] {
         timeline.setVolatile("")
-        let done = timeline.finalize(text)
-        // Finalized sentences never change again: translate without waiting for stability.
+        let done = timeline.finalize(text, runs: runs)
         for caption in done { requestTranslation(caption.source) }
         schedule()
+        return done
+    }
+
+    /// Close the unfinished sentence (end of the session); returns it if there was one.
+    @discardableResult
+    public func flush() -> CaptionTimeline.Caption? {
+        let tail = timeline.flush()
+        if let tail { requestTranslation(tail.source) }
+        return tail
     }
 
     /// Hide everything (speech paused); history is kept in `timeline`.

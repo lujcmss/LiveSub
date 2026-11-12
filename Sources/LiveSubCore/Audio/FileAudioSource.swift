@@ -16,6 +16,14 @@ public final class FileAudioSource: AudioSource, @unchecked Sendable {
     private var stopped = false
     private let bufferDuration: Double
 
+    /// Start playback this many seconds into the file (simulates seeking).
+    public var startAt: Double = 0
+    /// Simulate the viewer pausing: at `pauseAt` seconds of playback, wait `pauseFor` seconds.
+    /// `pauseDeliversSilence` chooses between silent buffers and no buffers at all.
+    public var pauseAt: Double?
+    public var pauseFor: Double = 0
+    public var pauseDeliversSilence = false
+
     public init(url: URL, bufferDuration: Double = 0.01) {
         self.url = url
         self.bufferDuration = bufferDuration
@@ -26,11 +34,32 @@ public final class FileAudioSource: AudioSource, @unchecked Sendable {
         let fmt = file.processingFormat
         format = fmt
         let frames = AVAudioFrameCount(fmt.sampleRate * bufferDuration)
-        let startHost = HostClock.now() + HostClock.ticks(seconds: 0.05)
         let audioFile = file
+        audioFile.framePosition = min(audioFile.length, AVAudioFramePosition(startAt * fmt.sampleRate))
+        let firstHost = HostClock.now() + HostClock.ticks(seconds: 0.05)
+        let pauseAt = self.pauseAt
         queue.async { [self] in
+            var startHost = firstHost
+            var pause = pauseAt
             var position: Double = 0
             while !stopped, audioFile.framePosition < audioFile.length {
+                if let at = pause, position >= at {
+                    pause = nil
+                    if pauseDeliversSilence {
+                        var waited = 0.0
+                        while waited < pauseFor, !stopped, let quiet = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frames) {
+                            quiet.frameLength = frames
+                            Thread.sleep(forTimeInterval: bufferDuration)
+                            waited += bufferDuration
+                            let now = HostClock.now()
+                            onBuffer(SourceBuffer(buffer: quiet, hostTime: now - HostClock.ticks(seconds: bufferDuration), receivedHostTime: now))
+                        }
+                    } else {
+                        Thread.sleep(forTimeInterval: pauseFor)
+                    }
+                    // Resume: later audio is stamped later by the length of the pause.
+                    startHost = HostClock.now() - HostClock.ticks(seconds: position)
+                }
                 guard let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: frames),
                       (try? audioFile.read(into: buf, frameCount: frames)) != nil, buf.frameLength > 0 else { break }
                 let host = startHost + HostClock.ticks(seconds: position)

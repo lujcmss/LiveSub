@@ -48,7 +48,7 @@ final class ConsoleRenderer: @unchecked Sendable {
             } else {
                 print("  ~ \(text)\(tag)")
             }
-        case let .final(text, latency, _):
+        case let .final(text, _, latency, _):
             clearPartial()
             let tag = latency.map { String(format: "  [final %.0f ms after last word]", $0) } ?? ""
             print("✓ \(text)\(isTTY ? "\u{1B}[2m\(tag)\u{1B}[0m" : tag)")

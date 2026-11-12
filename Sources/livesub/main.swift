@@ -33,6 +33,10 @@ usage:
       move/resize, quit). --seconds quits automatically; otherwise use the menu-bar icon.
       Translates into your Mac's language by default; --to LANG (en, zh-Hans, zh-Hant, … or none)
       chooses the target, --translation-only hides the original.
+      Subtitles are saved as you watch; when the same audio plays again they are shown from the
+      saved copy with no delay (--lead SECONDS shows them early, --no-save turns saving off).
+  livesub sessions [--delete ID|all]
+      List (or delete) the subtitle sessions saved for replay.
   livesub translation-setup --lang LANG[,LANG…] --to LANG[,LANG…]
       Ask macOS to download the translation models for those pairs (one-time, needs one click each).
   livesub translate --lang LANG --to LANG --text "…"
@@ -62,6 +66,15 @@ struct Options {
     var translationOnly = false
     var release = false
     var font: String?
+    var against: String?
+    var startAt: Double = 0
+    var gain: Double = 1
+    var noSave = false
+    var lead: Double?
+    var pauseAt: Double?
+    var pauseFor: Double = 0
+    var pauseSilence = false
+    var delete: String?
 }
 
 func parse(_ args: [String]) -> Options {
@@ -88,6 +101,15 @@ func parse(_ args: [String]) -> Options {
         case "--translation-only": o.translationOnly = true
         case "--release": o.release = true
         case "--font": o.font = val()
+        case "--against": o.against = (val() as NSString).expandingTildeInPath
+        case "--start-at": o.startAt = Double(val()) ?? 0
+        case "--gain": o.gain = Double(val()) ?? 1
+        case "--no-save": o.noSave = true
+        case "--lead": o.lead = Double(val())
+        case "--pause-at": o.pauseAt = Double(val())
+        case "--pause-for": o.pauseFor = Double(val()) ?? 0
+        case "--pause-silence": o.pauseSilence = true
+        case "--delete": o.delete = val()
         case "--idle-seconds": o.idleSeconds = Double(val())
         case "--snapshot": o.snapshot = (val() as NSString).expandingTildeInPath
         case "--out": o.out = URL(fileURLWithPath: (val() as NSString).expandingTildeInPath)
@@ -292,6 +314,12 @@ MainActor.assumeIsolated {
             }
         case "transcribe":
             try runTranscribe(opts)
+        case "sessions":
+            runSessions(opts)
+            exit(0)
+        case "sync-test":
+            try runSyncTest(opts)
+            exit(0)
         case "translation-setup":
             let sources = (opts.lang ?? "ja-JP").split(separator: ",").map { TranslationLanguage(speechLocale: String($0)) }
             let targets = (opts.to ?? "en").split(separator: ",").map { TranslationLanguage(speechLocale: String($0)) }
@@ -332,6 +360,12 @@ MainActor.assumeIsolated {
             if let lines = opts.lines { config.style.maxLines = max(1, lines) }
             if let idle = opts.idleSeconds { config.idleSeconds = idle }
             config.clickThrough = opts.clickThrough
+            config.saveSessions = !opts.noSave
+            if let lead = opts.lead { config.replayLead = lead }
+            config.fileStartAt = opts.startAt
+            config.filePauseAt = opts.pauseAt
+            config.filePauseFor = opts.pauseFor
+            config.filePauseSilence = opts.pauseSilence
             // Translate into the chosen language, else the last one used, else the Mac's first
             // preferred language that isn't the source. `--to none` shows the original only.
             let target = opts.to ?? UserDefaults.standard.string(forKey: "LiveSub.targetLanguage")

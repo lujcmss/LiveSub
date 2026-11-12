@@ -2,7 +2,7 @@
 
 Real-time, fully on-device subtitles for any audio playing on your Mac. macOS 26+, Apple silicon.
 
-Status: **milestone 4 of 5** (on-device translation). Settings and polish come next.
+Status: milestones 1-4 plus saved subtitles for zero-delay replay. Settings and polish come next.
 
 ## Build
 
@@ -33,6 +33,39 @@ No Xcode needed; the Command Line Tools are enough. Requires macOS 26.4 or later
 
 Launching through `open` matters: it makes macOS attribute the permission to LiveSub rather
 than to your terminal. `livesub list` shows which apps currently have audio.
+
+## Watch once, replay with no delay
+
+Live subtitles trail the speech by about 0.6 s, because the recognizer has to hear a word before
+it can write it. So LiveSub saves what it produces: while you watch, every sentence, its
+translation and its timing are written to
+`~/Library/Application Support/LiveSub/Sessions`, together with a compact fingerprint of the
+audio (the audio itself is not stored, and cannot be rebuilt from the fingerprint).
+
+When the same audio plays again, LiveSub recognizes it within a second or two, finds the exact
+position, and shows the saved subtitles on the clock instead of waiting for the recognizer:
+by default 0.1 s *before* each sentence starts (`--lead SECONDS` to change, `--no-save` to turn
+saving off). Because it syncs from the audio, pausing and seeking just work; audio that is not
+in a saved session falls back to live subtitles and is saved in turn.
+
+```bash
+build/LiveSub.app/Contents/MacOS/livesub sessions            # list saved sessions
+build/LiveSub.app/Contents/MacOS/livesub sessions --delete all
+```
+
+How it works: `AudioFingerprinter` produces a 32-bit sub-fingerprint every 16 ms (band-energy
+differences, after Haitsma & Kalker); `SessionMatcher` votes on alignments through an index of
+those values, confirms by bit error rate, then keeps verifying, notices pauses and re-locks
+after seeks. Measured:
+
+| Test | Result |
+|---|---|
+| Time to find the position after a seek | 0.9-1.7 s of audio |
+| Position error | under 10 ms |
+| Same audio re-encoded as 48 kbps AAC at half volume | locks, bit error rate 0.18 (limit 0.30) |
+| Unrelated audio | never locks |
+| Saved subtitle on screen relative to the start of its speech | 85 ms early (p95 60 ms early) |
+| Pause for 3 s (silence or no audio at all), then resume | stays in sync |
 
 ## Milestone 4: translation
 

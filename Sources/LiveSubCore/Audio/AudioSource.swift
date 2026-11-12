@@ -10,6 +10,12 @@ public struct SourceBuffer: @unchecked Sendable {
     public let hostTime: UInt64
     /// Host time at which our code received the buffer.
     public let receivedHostTime: UInt64
+
+    public init(buffer: AVAudioPCMBuffer, hostTime: UInt64, receivedHostTime: UInt64) {
+        self.buffer = buffer
+        self.hostTime = hostTime
+        self.receivedHostTime = receivedHostTime
+    }
 }
 
 /// Anything that can produce live PCM. Swappable so the pipeline doesn't care where audio comes from.

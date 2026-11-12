@@ -17,8 +17,14 @@ public struct ASRResult: Sendable, Equatable {
 
     public struct TimedRun: Sendable, Equatable {
         public var text: String
+        /// When this piece of text was spoken (seconds on the stream timeline).
+        public var start: Double
         public var end: Double
-        public init(text: String, end: Double) { self.text = text; self.end = end }
+        public init(text: String, start: Double? = nil, end: Double) {
+            self.text = text
+            self.start = start ?? end
+            self.end = end
+        }
     }
 
     public init(text: String, isFinal: Bool, audioStart: Double, audioEnd: Double,

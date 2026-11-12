@@ -17,6 +17,15 @@ struct OverlayConfig {
     var idleSeconds: Double = 5
     var snapshotDirectory: URL?
     var quitAfter: Double?
+    /// Save subtitles so a second viewing can show them with no delay.
+    var saveSessions = true
+    /// Show saved subtitles this many seconds before the speech starts.
+    var replayLead = 0.1
+    /// Test aids for --file: start position and a simulated pause.
+    var fileStartAt = 0.0
+    var filePauseAt: Double?
+    var filePauseFor = 0.0
+    var filePauseSilence = false
 }
 
 @MainActor
@@ -29,6 +38,9 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var engine = CaptionEngine(translator: nil)
     private var window = SentenceWindow()
     private var translationNote: String?
+    private var replay: ReplayController!
+    private var isReplaying = false
+    private var replayRows: [SubtitleView.Row] = []
     /// Display mode picked from the menu (overrides the launch option).
     private var userMode: SubtitleStyle.DisplayMode?
     private let stats = LatencyStats()
@@ -59,6 +71,23 @@ final class AppController: NSObject, NSApplicationDelegate {
         panel.subtitleView.hoverChanged = { [weak self] inside in
             self?.isHovering = inside
             self?.refreshFrameOutline()
+        }
+        replay = ReplayController(saveEnabled: config.saveSessions, lead: config.replayLead,
+                                  linger: config.idleSeconds, stats: stats)
+        replay.onStatus = { [weak self] status in
+            guard let self else { return }
+            if let status {
+                self.setStatus(status)
+            } else if self.isReady {
+                self.setStatus(self.liveStatus)
+            }
+        }
+        // Saved subtitles are driven by the clock, not by recognizer events.
+        Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tickReplay() }
+        }
+        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.saveSession(announce: false) }
         }
         panel.orderFrontRegardless()
         Log.debug("overlay frame \(NSStringFromRect(panel.frame)), level \(panel.level.rawValue), behavior \(panel.collectionBehavior.rawValue), visible \(panel.isVisible), clickThrough \(panel.clickThrough), screen \(NSStringFromRect(NSScreen.main?.frame ?? .zero))")
@@ -99,6 +128,10 @@ final class AppController: NSObject, NSApplicationDelegate {
             do {
                 if let file = config.file {
                     let f = FileAudioSource(url: URL(fileURLWithPath: file))
+                    f.startAt = config.fileStartAt
+                    f.pauseAt = config.filePauseAt
+                    f.pauseFor = config.filePauseFor
+                    f.pauseDeliversSilence = config.filePauseSilence
                     f.onEnd = { Task { @MainActor in self?.sourceEnded() } }
                     source = f
                     sourceName = f.label
@@ -122,6 +155,9 @@ final class AppController: NSObject, NSApplicationDelegate {
             let backend = AppleSpeechBackend(language: language)
             let pipeline = TranscriptionPipeline(source: source, backend: backend,
                                                  chunkDuration: config.chunkDuration, stats: self.stats)
+            let sync = self.replay.begin(language: language.id, target: self.engine.translator == nil ? nil : self.config.style.translationLanguage,
+                                         sourceName: sourceName)
+            pipeline.onChunk = { sync.ingest($0) }
             self.pipeline = pipeline
             self.isReady = false
             // While macOS shows its permission dialog, starting the audio tap simply blocks.
@@ -160,7 +196,49 @@ final class AppController: NSObject, NSApplicationDelegate {
         await pipeline?.stop()
         pipeline = nil
         pipelineTask = nil
+        // Give the last finals (queued on the main queue) and their translations a moment.
+        try? await Task.sleep(for: .milliseconds(250))
+        if let tail = engine.flush() { replay.record([tail]) }
+        try? await Task.sleep(for: .milliseconds(150))
+        saveSession(announce: true)
     }
+
+    private func saveSession(announce: Bool) {
+        guard let session = replay.save(translations: { [engine] in engine.translation(for: $0) }) else { return }
+        if announce {
+            print(String(format: "Saved %d subtitles (%.0f s) for replay: %@", session.captions.count, session.duration,
+                         replay.store.url(for: session.id).path))
+        }
+    }
+
+    /// Show saved subtitles when the audio is recognized; hand back to live ones when it is not.
+    private func tickReplay() {
+        guard !isPaused, let rows = replay.currentRows() else {
+            if isReplaying {
+                isReplaying = false
+                replayRows = []
+                window.reset()
+                render(stamp: nil)
+            }
+            return
+        }
+        if !isReplaying {
+            isReplaying = true
+            window.reset()
+        }
+        guard rows != replayRows else { return }
+        replayRows = rows
+        let view = panel.subtitleView!
+        let first = window.firstVisible(count: rows.count) { view.fits(Array(rows[$0...])) }
+        view.update(rows: Array(rows.dropFirst(first)))
+        if rows.isEmpty {
+            scheduleIdleFade(after: 0.3)
+        } else {
+            showOverlay()
+        }
+    }
+
+    private var liveStatus = "Listening"
 
     private func handle(_ event: TranscriptionPipeline.Event, sourceName: String, language: AppleSpeechBackend.Language) {
         guard !isPaused else { return }
@@ -172,15 +250,16 @@ final class AppController: NSObject, NSApplicationDelegate {
         case let .ready(recognizer, format):
             isReady = true
             print("Ready: \(recognizer), \(format). Listening to \(sourceName).")
-            setStatus("Listening to \(sourceName) · \(language.displayName)")
+            liveStatus = "Listening to \(sourceName) · \(language.displayName)"
+            setStatus(liveStatus)
             rebuildMenu()
             panel.subtitleView.showNotice("Listening to \(sourceName)…")
             scheduleIdleFade(after: 2.5)
         case let .partial(text, _, received):
             engine.handlePartial(text)
             render(stamp: received)
-        case let .final(text, latency, received):
-            engine.handleFinal(text)
+        case let .final(text, runs, latency, received):
+            recordCaptions(engine.handleFinal(text, runs: runs))
             print("✓ \(text)" + (latency.map { String(format: "  [final %.0f ms after last word]", $0) } ?? ""))
             render(stamp: received)
         case .sentence:
@@ -201,6 +280,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         setStatus(message)
         panel.subtitleView.showNotice(message)
         showOverlay()
+    }
+
+    private func recordCaptions(_ captions: [CaptionTimeline.Caption]) {
+        replay.record(captions)
     }
 
     // MARK: Rendering
@@ -258,7 +341,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     // MARK: Rendering
 
     private func render(stamp: UInt64?) {
-        guard !isPaused else { return }
+        // While saved subtitles are showing, live results are only collected, not drawn.
+        guard !isPaused, !isReplaying else { return }
         let view = panel.subtitleView!
         var rows = engine.rows.map {
             SubtitleView.Row(source: $0.source, translation: $0.translation, isProvisional: $0.isProvisional)
