@@ -1,14 +1,16 @@
 import AppKit
+import Carbon.HIToolbox
+import Combine
 import LiveSubCore
 
-/// What to listen to and how to show it; filled from the command line now, Settings later.
+/// What one run listens to and how it shows it. The user-facing choices are copied in from
+/// `AppSettings`; the rest are options for test runs.
 struct OverlayConfig {
-    var language: String
+    var language: String = "ja-JP"
     var appQuery: String?
     var file: String?
     /// Translation target ("en", "zh-Hans", …); nil shows the original language only.
     var target: String?
-    var translationOnly = false
     var engine: AppleSpeechBackend.Engine?
     var chunkDuration: Double = 0.1
     var style = SubtitleStyle()
@@ -29,7 +31,7 @@ struct OverlayConfig {
 }
 
 @MainActor
-final class AppController: NSObject, NSApplicationDelegate {
+final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var config: OverlayConfig
     private var panel: OverlayPanel!
     private var statusItem: NSStatusItem!
@@ -41,8 +43,10 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var replay: ReplayController!
     private var isReplaying = false
     private var replayRows: [SubtitleView.Row] = []
-    /// Display mode picked from the menu (overrides the launch option).
-    private var userMode: SubtitleStyle.DisplayMode?
+    let settings: AppSettings
+    private var settingsObserver: AnyCancellable?
+    private var restartTask: Task<Void, Never>?
+    private var outputMonitor: AudioOutputMonitor?
     private let stats = LatencyStats()
     private var idleTimer: Timer?
     private var activity: NSObjectProtocol?
@@ -54,8 +58,51 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var snapshotIndex = 0
     private var lastSnapshot = ""
 
-    init(config: OverlayConfig) {
+    init(settings: AppSettings, config: OverlayConfig) {
+        self.settings = settings
         self.config = config
+        super.init()
+        copySettingsIntoConfig()
+    }
+
+    /// Bring the user's choices into the run configuration.
+    private func copySettingsIntoConfig() {
+        config.language = settings.sourceLanguage
+        config.appQuery = settings.sourceApp.isEmpty ? nil : settings.sourceApp
+        config.target = settings.target
+        config.style = settings.style(basedOn: config.style)
+        config.clickThrough = settings.clickThrough
+        config.idleSeconds = settings.idleSeconds
+        config.saveSessions = settings.saveSessions
+        config.replayLead = settings.replayLead
+    }
+
+    /// Called after any setting changed: restart listening if what we listen to changed,
+    /// otherwise just restyle what is on screen.
+    private func settingsChanged() {
+        let before = [config.language, config.appQuery ?? "", config.target ?? "", "\(config.saveSessions)"]
+        copySettingsIntoConfig()
+        let after = [config.language, config.appQuery ?? "", config.target ?? "", "\(config.saveSessions)"]
+        panel.clickThrough = config.clickThrough
+        replay.lead = config.replayLead
+        replay.linger = config.idleSeconds
+        replay.saveEnabled = config.saveSessions
+        applyStyle()
+        window.reset()
+        replayRows = []
+        render(stamp: nil)
+        rebuildMenu()
+        guard before != after, !isPaused else { return }
+        // Several settings often change together (and sliders fire repeatedly): restart once.
+        restartTask?.cancel()
+        restartTask = Task {
+            try? await Task.sleep(for: .milliseconds(350))
+            guard !Task.isCancelled else { return }
+            await self.stop()
+            guard !Task.isCancelled, !self.isPaused else { return }
+            self.engine.clearScreen()
+            self.start()
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -63,6 +110,10 @@ final class AppController: NSObject, NSApplicationDelegate {
         // otherwise delay a background menu-bar app's drawing by ~100 ms.
         activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical],
                                                          reason: "Showing live subtitles")
+        settingsObserver = settings.objectWillChange.sink { [weak self] _ in
+            // The notification comes before the value changes; read it on the next turn.
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.settingsChanged() } }
+        }
         panel = OverlayPanel(style: config.style)
         panel.clickThrough = config.clickThrough
         panel.subtitleView.onDrawn = { [stats] stamp in
@@ -86,6 +137,39 @@ final class AppController: NSObject, NSApplicationDelegate {
         Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tickReplay() }
         }
+        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.transcriptWindow.isVisible else { return }
+                self.transcriptWindow.update(self.currentTranscript())
+            }
+        }
+        registerShortcuts()
+        loadMenuLanguages()
+        // First launch as an app: say what LiveSub is and what the permission dialog is for.
+        if settings.persist, config.file == nil, !UserDefaults.standard.bool(forKey: "LiveSub.didWelcome") {
+            UserDefaults.standard.set(true, forKey: "LiveSub.didWelcome")
+            WelcomeWindowController.show { [weak self] in self?.openSettings() }
+        }
+        // Development aid: LIVESUB_SETTINGS_SNAPSHOT=DIR saves pictures of the Settings tabs.
+        if let dir = ProcessInfo.processInfo.environment["LIVESUB_SETTINGS_SNAPSHOT"] {
+            Task {
+                try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+                for tab in 0..<3 {
+                    SettingsWindowController.show(settings: self.settings, store: self.replay.store, tab: tab) {}
+                    self.render(stamp: nil)
+                    try? await Task.sleep(for: .milliseconds(1500))
+                    try? SettingsWindowController.snapshotPNG()?.write(to: URL(fileURLWithPath: dir).appendingPathComponent("settings-\(tab).png"))
+                    if tab == 1, let png = self.panel.subtitleView.snapshotPNG() {
+                        try? png.write(to: URL(fileURLWithPath: dir).appendingPathComponent("sample.png"))
+                    }
+                    SettingsWindowController.close()
+                    try? await Task.sleep(for: .milliseconds(300))
+                }
+            }
+        }
+        outputMonitor = AudioOutputMonitor { [weak self] in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.outputDeviceChanged() } }
+        }
         Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.saveSession(announce: false) }
         }
@@ -106,6 +190,35 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         if let seconds = config.quitAfter {
             DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { [weak self] in self?.quit() }
+        }
+    }
+
+    /// Audio is arriving but it is pure digital silence: either nothing is playing, or macOS
+    /// is withholding the audio because the permission was not granted.
+    private func hearingOnlySilence(_ silent: Bool) {
+        guard isReady, !isPaused, !isReplaying else { return }
+        setStatus(silent ? "Hearing only silence. If something is playing, see Audio Permission Help" : liveStatus)
+    }
+
+    private func registerShortcuts() {
+        let mods = controlKey | optionKey
+        HotKeys.register(id: 1, keyCode: kVK_ANSI_C, modifiers: mods) { [weak self] in self?.copySentence() }
+        HotKeys.register(id: 2, keyCode: kVK_ANSI_E, modifiers: mods) { [weak self] in self?.explainInClaude() }
+        HotKeys.register(id: 3, keyCode: kVK_ANSI_G, modifiers: mods) { [weak self] in self?.searchInGoogle() }
+        HotKeys.register(id: 4, keyCode: kVK_ANSI_T, modifiers: mods) { [weak self] in self?.showTranscript() }
+    }
+
+    /// Headphones plugged in, AirPods connected…: the audio tap is tied to the old device.
+    private func outputDeviceChanged() {
+        guard config.file == nil, !isPaused, pipeline != nil else { return }
+        print("Output device changed: restarting audio capture")
+        restartTask?.cancel()
+        restartTask = Task {
+            try? await Task.sleep(for: .milliseconds(800))
+            guard !Task.isCancelled else { return }
+            await self.stop()
+            guard !Task.isCancelled, !self.isPaused else { return }
+            self.start()
         }
     }
 
@@ -137,7 +250,14 @@ final class AppController: NSObject, NSApplicationDelegate {
                     sourceName = f.label
                 } else if let query = config.appQuery {
                     guard let app = try AudioProcessCatalog.findApp(query) else {
-                        self?.fail("\"\(query)\" isn't playing audio. Start playback, then choose Resume.")
+                        // The chosen app is not running or has not played anything yet: wait for it.
+                        guard let self else { return }
+                        let name = AppNames.name(forBundleID: query)
+                        self.setStatus("Waiting for \(name) to play audio")
+                        self.panel.subtitleView.showNotice("Waiting for \(name) to play something…")
+                        self.scheduleIdleFade(after: 4)
+                        try? await Task.sleep(for: .seconds(3))
+                        if !self.isPaused, self.pipeline == nil, !Task.isCancelled { self.start() }
                         return
                     }
                     source = ProcessTapSource(target: .app(bundleID: app.bundleID, name: app.name))
@@ -157,7 +277,13 @@ final class AppController: NSObject, NSApplicationDelegate {
                                                  chunkDuration: config.chunkDuration, stats: self.stats)
             let sync = self.replay.begin(language: language.id, target: self.engine.translator == nil ? nil : self.config.style.translationLanguage,
                                          sourceName: sourceName)
-            pipeline.onChunk = { sync.ingest($0) }
+            let silence = SilenceWatch()
+            pipeline.onChunk = { chunk in
+                sync.ingest(chunk)
+                if let hearingSilence = silence.note(chunk) {
+                    DispatchQueue.main.async { MainActor.assumeIsolated { self.hearingOnlySilence(hearingSilence) } }
+                }
+            }
             self.pipeline = pipeline
             self.isReady = false
             // While macOS shows its permission dialog, starting the audio tap simply blocks.
@@ -284,6 +410,8 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     private func recordCaptions(_ captions: [CaptionTimeline.Caption]) {
         replay.record(captions)
+        transcript.append(contentsOf: captions.map { .init(source: $0.source, translation: engine.translation(for: $0.source)) })
+        if transcript.count > 2000 { transcript.removeFirst(transcript.count - 2000) }
     }
 
     // MARK: Rendering
@@ -324,16 +452,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         engine = CaptionEngine(translator: translator, stats: stats)
         engine.onChange = { [weak self] in self?.render(stamp: nil) }
         window.reset()
-        if translator == nil {
-            config.style.mode = .originalOnly
-        } else if config.style.mode == .originalOnly || userMode == nil {
-            config.style.mode = config.translationOnly ? .translationOnly : .both
-        }
-        if let userMode, translator != nil { config.style.mode = userMode }
         applyStyle()
     }
 
     private func applyStyle() {
+        // Without a translator there is only the original to show.
+        config.style.mode = engine.translator == nil ? .originalOnly : settings.displayMode
         panel.subtitleView.style = config.style
         panel.applyHeight(for: config.style)
     }
@@ -349,11 +473,30 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         if !rows.isEmpty { rows[rows.count - 1].tentativeCount = engine.tentativeCount }
         // Start at a sentence boundary: drop whole leading sentences until the rest fits.
+        if rows.isEmpty, SettingsWindowController.isOpen {
+            // Nothing is being said: show a sample so appearance changes can be judged.
+            view.update(rows: [sampleRow])
+            showOverlay()
+            return
+        }
         let first = window.firstVisible(count: rows.count) { view.fits(Array(rows[$0...])) }
         view.update(rows: Array(rows.dropFirst(first)), stamp: stamp)
         guard !rows.isEmpty else { return }
         showOverlay()
         scheduleIdleFade(after: config.idleSeconds)
+    }
+
+    private static let samples: [String: String] = [
+        "en": "This is how your subtitles will look.", "ja": "字幕はこのように表示されます。",
+        "ko": "자막은 이렇게 표시됩니다.", "zh-Hans": "字幕会这样显示。", "zh-Hant": "字幕會這樣顯示。",
+        "es": "Así se verán tus subtítulos.", "fr": "Voici à quoi ressembleront vos sous-titres.",
+        "de": "So sehen deine Untertitel aus.", "it": "Ecco come appariranno i sottotitoli.", "pt": "É assim que as legendas vão aparecer.",
+    ]
+
+    private var sampleRow: SubtitleView.Row {
+        let source = Self.samples[TranslationLanguage(speechLocale: settings.sourceLanguage).id] ?? Self.samples["en"]!
+        let target = settings.target.flatMap { Self.samples[TranslationLanguage(speechLocale: $0).id] } ?? Self.samples["en"]!
+        return SubtitleView.Row(source: source, translation: target)
     }
 
     private func showOverlay() {
@@ -367,7 +510,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         idleTimer?.invalidate()
         idleTimer = Timer.scheduledTimer(withTimeInterval: seconds, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, !self.isRepositioning else { return }
+                guard let self, !self.isRepositioning, !SettingsWindowController.isOpen else { return }
                 NSAnimationContext.runAnimationGroup({ ctx in
                     ctx.duration = 0.6
                     self.panel.animator().alphaValue = 0
@@ -398,6 +541,11 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     // MARK: Menu bar
 
+    func menuWillOpen(_ menu: NSMenu) {
+        // Languages may have been installed since launch.
+        if menu === statusItem.menu { loadMenuLanguages() }
+    }
+
     private func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
@@ -424,27 +572,199 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         menu.addItem(.separator())
         menu.addItem(item(isPaused ? "Resume Subtitles" : "Pause Subtitles", #selector(togglePause), key: "p"))
+
+        // Quick pickers; the full lists are in Settings.
+        menu.addItem(submenu("Spoken Language", menuLanguages.map { language in
+            let i = item(language.displayName, #selector(chooseLanguage(_:)), key: "")
+            i.representedObject = language.id
+            i.state = language.id == settings.sourceLanguage ? .on : .off
+            return i
+        } + [.separator(), item("More Languages…", #selector(openSettings), key: "")]))
+
+        var targetItems: [NSMenuItem] = [{
+            let i = item("Don't Translate", #selector(chooseTarget(_:)), key: "")
+            i.representedObject = "none"
+            i.state = settings.targetLanguage == "none" ? .on : .off
+            return i
+        }(), .separator()]
+        targetItems += menuTargets.prefix(8).map { language in
+            let i = item(language.displayName, #selector(chooseTarget(_:)), key: "")
+            i.representedObject = language.id
+            i.state = language.id == settings.targetLanguage ? .on : .off
+            return i
+        }
+        targetItems += [.separator(), item("More Languages…", #selector(openSettings), key: "")]
+        menu.addItem(submenu("Translate Into", targetItems))
+
+        var appItems: [NSMenuItem] = [{
+            let i = item("Everything This Mac Plays", #selector(chooseApp(_:)), key: "")
+            i.representedObject = ""
+            i.state = settings.sourceApp.isEmpty ? .on : .off
+            return i
+        }(), .separator()]
+        var apps = ((try? AudioProcessCatalog.apps()) ?? []).map { ($0.bundleID, $0.name + ($0.isPlayingAudio ? "  ●" : "")) }
+        if !settings.sourceApp.isEmpty, !apps.contains(where: { $0.0 == settings.sourceApp }) {
+            apps.insert((settings.sourceApp, AppNames.name(forBundleID: settings.sourceApp)), at: 0)
+        }
+        appItems += apps.map { bundleID, name in
+            let i = item(name, #selector(chooseApp(_:)), key: "")
+            i.representedObject = bundleID
+            i.state = bundleID == settings.sourceApp ? .on : .off
+            return i
+        }
+        menu.addItem(submenu("Listen To", appItems))
+
         if engine.translator != nil {
-            let show = NSMenuItem(title: "Show", action: nil, keyEquivalent: "")
-            let sub = NSMenu()
-            for (title, mode) in [("Original and Translation", SubtitleStyle.DisplayMode.both),
-                                  ("Translation Only", .translationOnly), ("Original Only", .originalOnly)] {
+            menu.addItem(submenu("Show", [("Original and Translation", SubtitleStyle.DisplayMode.both),
+                                          ("Translation Only", .translationOnly), ("Original Only", .originalOnly)].map { title, mode in
                 let i = item(title, #selector(chooseMode(_:)), key: "")
                 i.representedObject = mode.rawValue
-                i.state = config.style.mode == mode ? .on : .off
-                sub.addItem(i)
-            }
-            show.submenu = sub
-            menu.addItem(show)
+                i.state = settings.displayMode == mode ? .on : .off
+                return i
+            }))
         }
-        let through = item("Click Through Subtitles", #selector(toggleClickThrough), key: "t")
+        menu.addItem(.separator())
+        menu.addItem(item("Copy Sentence", #selector(copySentence), key: "c", modifiers: [.control, .option]))
+        menu.addItem(item("Explain in Claude", #selector(explainInClaude), key: "e", modifiers: [.control, .option]))
+        menu.addItem(item("Search in Google", #selector(searchInGoogle), key: "g", modifiers: [.control, .option]))
+        menu.addItem(item("Show Transcript", #selector(showTranscript), key: "t", modifiers: [.control, .option]))
+        menu.addItem(.separator())
+        let through = item("Click Through Subtitles", #selector(toggleClickThrough), key: "")
         through.state = panel.clickThrough ? .on : .off
         menu.addItem(through)
         menu.addItem(item("Move or Resize Subtitles…", #selector(reposition), key: "m"))
         menu.addItem(item("Reset Position", #selector(resetPosition), key: ""))
         menu.addItem(.separator())
+        menu.addItem(item("Audio Permission Help…", #selector(openPrivacySettings), key: ""))
+        menu.addItem(item("Settings…", #selector(openSettings), key: ","))
         menu.addItem(item("Quit LiveSub", #selector(quit), key: "q"))
+        menu.delegate = self
         statusItem.menu = menu
+    }
+
+    private func submenu(_ title: String, _ items: [NSMenuItem]) -> NSMenuItem {
+        let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        for i in items { sub.addItem(i) }
+        parent.submenu = sub
+        return parent
+    }
+
+    private func item(_ title: String, _ action: Selector, key: String, modifiers: NSEvent.ModifierFlags) -> NSMenuItem {
+        let i = item(title, action, key: key)
+        i.keyEquivalentModifierMask = modifiers
+        return i
+    }
+
+    /// Languages for the quick menus: those installed for speech, and the translation targets.
+    private var menuLanguages: [AppleSpeechBackend.Language] = []
+    private var menuTargets: [TranslationLanguage] = []
+
+    private func loadMenuLanguages() {
+        Task {
+            let all = await AppleSpeechBackend.languages()
+            // One entry per language (the main regional variant), installed ones only.
+            let preferred = ["en-US", "ja-JP", "ko-KR", "es-ES", "fr-FR", "zh-CN", "zh-TW", "de-DE", "it-IT", "pt-BR", "yue-CN"]
+            var list = all.filter { $0.isInstalled && preferred.contains($0.id) }
+            if let current = all.first(where: { $0.id == self.settings.sourceLanguage }), !list.contains(current) { list.append(current) }
+            self.menuLanguages = list.sorted { $0.displayName < $1.displayName }
+            self.menuTargets = await AppleTranslator.targetLanguages()
+            self.rebuildMenu()
+        }
+    }
+
+    @objc private func chooseLanguage(_ sender: NSMenuItem) {
+        if let id = sender.representedObject as? String { settings.sourceLanguage = id }
+    }
+
+    @objc private func chooseTarget(_ sender: NSMenuItem) {
+        if let id = sender.representedObject as? String { settings.targetLanguage = id }
+    }
+
+    @objc private func chooseApp(_ sender: NSMenuItem) {
+        if let id = sender.representedObject as? String { settings.sourceApp = id }
+    }
+
+    /// Opens the pane where LiveSub can be allowed to record system audio.
+    @objc private func openPrivacySettings() {
+        let alert = NSAlert()
+        alert.messageText = "LiveSub needs to hear your Mac's audio"
+        alert.informativeText = "If subtitles never appear while something is playing, macOS is probably not letting LiveSub listen.\n\nIn System Settings › Privacy & Security › Screen & System Audio Recording, scroll to “System Audio Recording Only” and turn LiveSub on. Then choose Pause and Resume from the LiveSub menu."
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn,
+           let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc func openSettings() {
+        SettingsWindowController.show(settings: settings, store: replay.store) { [weak self] in
+            // Settings closed: stop holding the sample on screen.
+            self?.scheduleIdleFade(after: 0.5)
+        }
+        render(stamp: nil)
+    }
+
+    // MARK: Copy, explain, transcript
+
+    /// The sentence on screen right now (or the last one), with its translation.
+    private var currentSentence: (source: String, translation: String?)? {
+        if isReplaying, let row = replayRows.last { return (row.source, row.translation) }
+        if let c = engine.currentSentence { return c }
+        return transcript.last.map { ($0.source, $0.translation) }
+    }
+
+    @objc private func copySentence() {
+        guard let sentence = currentSentence else { flash("Nothing to copy yet"); return }
+        let text = [sentence.source, sentence.translation].compactMap { $0 }.joined(separator: "\n")
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        flash("Copied")
+    }
+
+    /// Opens the sentence in the browser. This is the one thing that leaves the Mac, and only
+    /// when asked.
+    @objc private func explainInClaude() {
+        guard let sentence = currentSentence else { flash("Nothing to explain yet"); return }
+        let language = Locale(identifier: "en").localizedString(forLanguageCode: TranslationLanguage(speechLocale: config.language).id) ?? "foreign-language"
+        var prompt = "Explain this \(language) sentence from something I'm watching: what it means, how the grammar works, and any vocabulary or nuance worth knowing.\n\n\(sentence.source)"
+        if let t = sentence.translation { prompt += "\n\nMy subtitles translated it as: \(t)" }
+        open("https://claude.ai/new", query: prompt)
+    }
+
+    @objc private func searchInGoogle() {
+        guard let sentence = currentSentence else { flash("Nothing to search yet"); return }
+        open("https://www.google.com/search", query: sentence.source)
+    }
+
+    private func open(_ base: String, query: String) {
+        var components = URLComponents(string: base)!
+        components.queryItems = [URLQueryItem(name: "q", value: query)]
+        if let url = components.url { NSWorkspace.shared.open(url) }
+    }
+
+    /// Brief confirmation next to the menu-bar icon.
+    private func flash(_ text: String) {
+        guard let button = statusItem.button else { return }
+        button.title = " " + text
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.4) { [weak button] in button?.title = "" }
+    }
+
+    private var transcript: [TranscriptWindow.Entry] = []
+    private let transcriptWindow = TranscriptWindow()
+
+    private func currentTranscript() -> [TranscriptWindow.Entry] {
+        // Fill in translations that arrived after the sentence was recorded.
+        for i in transcript.indices where transcript[i].translation == nil {
+            transcript[i].translation = engine.translation(for: transcript[i].source)
+        }
+        return transcript
+    }
+
+    @objc private func showTranscript() {
+        transcriptWindow.show(currentTranscript())
     }
 
     private func item(_ title: String, _ action: Selector, key: String) -> NSMenuItem {
@@ -469,17 +789,11 @@ final class AppController: NSObject, NSApplicationDelegate {
 
     @objc private func chooseMode(_ sender: NSMenuItem) {
         guard let raw = sender.representedObject as? String, let mode = SubtitleStyle.DisplayMode(rawValue: raw) else { return }
-        userMode = mode
-        config.style.mode = mode
-        window.reset()
-        applyStyle()
-        render(stamp: nil)
-        rebuildMenu()
+        settings.displayMode = mode
     }
 
     @objc private func toggleClickThrough() {
-        panel.clickThrough.toggle()
-        rebuildMenu()
+        settings.clickThrough.toggle()
     }
 
     /// Show the window outline for a while so it can be dragged and resized even when no
@@ -522,10 +836,10 @@ nonisolated(unsafe) private var retainedController: AppController?
 
 /// Start the menu-bar app. Does not return.
 @MainActor
-func runOverlayApp(_ config: OverlayConfig) -> Never {
+func runOverlayApp(settings: AppSettings, config: OverlayConfig) -> Never {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)   // menu bar only, no Dock icon
-    let controller = AppController(config: config)
+    let controller = AppController(settings: settings, config: config)
     retainedController = controller
     app.delegate = controller
     for sig in [SIGINT, SIGTERM] {
@@ -546,5 +860,24 @@ private struct StubTranslator: Translator {
     func translate(_ text: String) async throws -> String {
         try await Task.sleep(for: .milliseconds(120))
         return "(\(tag)) This is where the translation of a \(text.count)-character sentence goes."
+    }
+}
+
+/// Notices when the incoming audio has been digital silence for a while (and when sound returns).
+private final class SilenceWatch: @unchecked Sendable {
+    private var silentSeconds = 0.0
+    private var reported = false
+
+    /// Returns true/false when the "only silence" state changes, nil otherwise. Audio queue only.
+    func note(_ chunk: AudioChunk) -> Bool? {
+        let duration = Double(chunk.buffer.frameLength) / chunk.buffer.format.sampleRate
+        if chunk.levelDB <= -120 {
+            silentSeconds += duration
+            if silentSeconds >= 20, !reported { reported = true; return true }
+        } else {
+            silentSeconds = 0
+            if reported { reported = false; return false }
+        }
+        return nil
     }
 }

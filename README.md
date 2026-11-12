@@ -1,8 +1,61 @@
 # LiveSub
 
-Real-time, fully on-device subtitles for any audio playing on your Mac. macOS 26+, Apple silicon.
+Live subtitles, with a translation, for anything your Mac is playing: a Netflix tab, a video
+call, a podcast. Everything runs on your Mac; no audio or text is sent anywhere.
+macOS 26.4 or later, Apple silicon.
 
-Status: milestones 1-4 plus saved subtitles for zero-delay replay. Settings and polish come next.
+![Japanese with English beneath](docs/overlay-translation-ja-en.png)
+
+- **Live**: text appears about 0.6 s after it is spoken; its translation about 50 ms later.
+- **Original and translation together**, so you can compare them (or show just one).
+- **Watch once, replay with no delay**: subtitles are saved as you watch, and when the same
+  audio plays again they are shown from the saved copy, slightly ahead of the speech.
+- **Japanese, Korean, Spanish, French, English, Chinese and more** as the spoken language;
+  translation into English, Simplified or Traditional Chinese, and about 20 other languages.
+- **Copy and look up**: one shortcut copies the current sentence; others send it to Claude or
+  Google for an explanation.
+
+## Install and open
+
+```bash
+./scripts/install.sh
+```
+
+builds LiveSub and puts it in Applications. Open it like any app (Spotlight: ⌘Space, "LiveSub").
+It has no Dock icon; look for the captions icon in the menu bar. The first time, macOS asks to
+let LiveSub record system audio: choose Allow.
+
+Everything is in the menu-bar icon:
+
+- **Spoken Language**, **Translate Into**, **Listen To** (one app, or everything the Mac plays)
+- **Show**: original and translation, translation only, or original only
+- **Pause**, **Click Through Subtitles**, **Move or Resize Subtitles…**
+- **Settings…**: font, size, colors, line spacing, how long subtitles stay, saved subtitles
+
+Drag the subtitles to move them; hover and drag the left or right edge to resize.
+
+| Shortcut | Does |
+|---|---|
+| ⌃⌥C | Copy the current sentence (original and translation) |
+| ⌃⌥E | Explain the sentence in Claude (opens your browser) |
+| ⌃⌥G | Search the sentence in Google (opens your browser) |
+| ⌃⌥T | Show the transcript window, where any text can be selected and copied |
+
+![Appearance settings](docs/settings-appearance.png)
+
+## Privacy and offline use
+
+- Capture, speech recognition and translation all happen on the Mac. During a run the LiveSub
+  process holds no network connections (checked with `lsof` and `nettop`).
+- The only downloads are Apple's own models, once per language: speech models download
+  automatically; translation models ask through Apple's dialog. After that LiveSub works with
+  networking off.
+- "Explain in Claude" and "Search in Google" open a web page with the sentence in it. They only
+  run when you trigger them.
+- Saved subtitles live in `~/Library/Application Support/LiveSub/Sessions` (text, timing and an
+  audio fingerprint; never audio). Delete them in Settings › Saved Subtitles.
+
+The rest of this file is for developers: how each stage works and what was measured.
 
 ## Build
 
@@ -15,7 +68,7 @@ No Xcode needed; the Command Line Tools are enough. Requires macOS 26.4 or later
 
 (The scripts build against the macOS 26 SDK; see `scripts/sdk.sh` for why.)
 
-## Milestone 1: check that capture works (e.g. Netflix in Safari)
+## Audio capture (command-line check)
 
 1. Start playback in Safari.
 2. Run a 30-second capture of Safari only:
@@ -34,7 +87,7 @@ No Xcode needed; the Command Line Tools are enough. Requires macOS 26.4 or later
 Launching through `open` matters: it makes macOS attribute the permission to LiveSub rather
 than to your terminal. `livesub list` shows which apps currently have audio.
 
-## Watch once, replay with no delay
+## How replay works
 
 Live subtitles trail the speech by about 0.6 s, because the recognizer has to hear a word before
 it can write it. So LiveSub saves what it produces: while you watch, every sentence, its
@@ -67,7 +120,7 @@ after seeks. Measured:
 | Saved subtitle on screen relative to the start of its speech | 85 ms early (p95 60 ms early) |
 | Pause for 3 s (silence or no audio at all), then resume | stays in sync |
 
-## Milestone 4: translation
+## Translation
 
 ```bash
 open build/LiveSub.app
@@ -112,7 +165,7 @@ Measured on a Japanese recording (Korean, Spanish and French are within ~20 ms o
 So a finished sentence has its translation on screen about 0.7 s after its last word (p95 about
 1.15 s), against a target of 3 s.
 
-## Milestone 3: the subtitle overlay
+## The overlay
 
 Start playback in any app, then:
 
@@ -146,7 +199,7 @@ How it behaves:
 Measured: recognizer output → drawn on screen 4 ms p50, 15 ms p95 (the app opts out of App Nap;
 without that a background app's drawing lagged ~100 ms at p95).
 
-## Milestone 2: live transcription in the console
+## Transcription (command-line check)
 
 ```bash
 build/LiveSub.app/Contents/MacOS/livesub languages     # what can be transcribed, and what is installed

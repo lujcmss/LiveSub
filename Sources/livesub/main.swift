@@ -289,11 +289,10 @@ func onStopRequest(after seconds: Double?, _ handler: @escaping @Sendable () -> 
 nonisolated(unsafe) var signalSources: [DispatchSourceSignal] = []
 
 var opts = parse(CommandLine.arguments)
-// Opened as an app (double-click or `open LiveSub.app`) with no command: show subtitles for
-// all system audio in the last-used language.
+// Opened as an app (Spotlight, Finder, `open LiveSub.app`) with no command: run the overlay
+// with the saved settings.
 if CommandLine.arguments.count == 1, Bundle.main.bundlePath.hasSuffix(".app") {
     opts.command = "overlay"
-    opts.lang = UserDefaults.standard.string(forKey: "LiveSub.sourceLanguage") ?? "ja-JP"
 }
 MainActor.assumeIsolated {
     do {
@@ -346,36 +345,31 @@ MainActor.assumeIsolated {
                 exit(0)
             }
         case "overlay":
-            guard let lang = opts.lang else {
-                print("overlay needs --lang (for example --lang ja-JP). Run `livesub languages` for the list.")
-                exit(2)
-            }
-            // Remember the language for next launch (but not for timed test runs).
-            if !opts.secondsSet { UserDefaults.standard.set(lang, forKey: "LiveSub.sourceLanguage") }
-            var config = OverlayConfig(language: lang, appQuery: opts.app, file: opts.file)
+            // Choices made on the command line are remembered like choices made in Settings,
+            // except in timed test runs (--seconds).
+            let settings = AppSettings(persist: !opts.secondsSet)
+            if let lang = opts.lang { settings.sourceLanguage = lang }
+            if let to = opts.to { settings.targetLanguage = to }
+            if let app = opts.app { settings.sourceApp = app }
+            if let size = opts.fontSize { settings.fontSize = size }
+            if let font = opts.font { settings.fontName = font }
+            if let lines = opts.lines { settings.maxLines = max(1, lines) }
+            if let idle = opts.idleSeconds { settings.idleSeconds = idle }
+            if let lead = opts.lead { settings.replayLead = lead }
+            if opts.clickThrough { settings.clickThrough = true }
+            if opts.translationOnly { settings.displayMode = .translationOnly }
+            if opts.noSave { settings.saveSessions = false }
+            var config = OverlayConfig()
+            config.file = opts.file
             config.engine = opts.engine == "dictation" ? .dictation : opts.engine == "speech" ? .speechTranscriber : nil
             config.chunkDuration = opts.chunkMS / 1000
-            if let size = opts.fontSize { config.style.fontSize = size }
-            if let font = opts.font { config.style.fontName = font }
-            if let lines = opts.lines { config.style.maxLines = max(1, lines) }
-            if let idle = opts.idleSeconds { config.idleSeconds = idle }
-            config.clickThrough = opts.clickThrough
-            config.saveSessions = !opts.noSave
-            if let lead = opts.lead { config.replayLead = lead }
             config.fileStartAt = opts.startAt
             config.filePauseAt = opts.pauseAt
             config.filePauseFor = opts.pauseFor
             config.filePauseSilence = opts.pauseSilence
-            // Translate into the chosen language, else the last one used, else the Mac's first
-            // preferred language that isn't the source. `--to none` shows the original only.
-            let target = opts.to ?? UserDefaults.standard.string(forKey: "LiveSub.targetLanguage")
-                ?? AppleTranslator.defaultTarget(for: TranslationLanguage(speechLocale: lang)).id
-            config.target = target == "none" ? nil : target
-            if !opts.secondsSet, opts.to != nil { UserDefaults.standard.set(target, forKey: "LiveSub.targetLanguage") }
-            config.translationOnly = opts.translationOnly
             config.snapshotDirectory = opts.snapshot.map { URL(fileURLWithPath: $0) }
             config.quitAfter = opts.secondsSet ? opts.seconds : nil
-            runOverlayApp(config)
+            runOverlayApp(settings: settings, config: config)
         default:
             print(usage)
             exit(opts.command == "help" || opts.command == "--help" ? 0 : 2)
