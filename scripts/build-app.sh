@@ -1,0 +1,18 @@
+#!/bin/zsh
+# Build LiveSub.app with SwiftPM and sign it ad-hoc ("Sign to Run Locally"). No Xcode or paid account needed.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+CONFIG=${1:-release}
+source scripts/sdk.sh
+swift build -c "$CONFIG" --product livesub
+BIN="$(swift build -c "$CONFIG" --show-bin-path)/livesub"
+APP=build/LiveSub.app
+rm -rf "$APP"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp "$BIN" "$APP/Contents/MacOS/livesub"
+cp Resources/Info.plist "$APP/Contents/Info.plist"
+# Ad-hoc signature with a stable identifier so macOS privacy permissions stick to the bundle ID.
+codesign --force --sign - --identifier app.livesub.LiveSub --options runtime \
+  --entitlements Resources/LiveSub.entitlements "$APP"
+codesign --verify --verbose=1 "$APP"
+echo "Built $PWD/$APP"

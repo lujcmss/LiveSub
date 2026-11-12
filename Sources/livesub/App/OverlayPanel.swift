@@ -1,0 +1,250 @@
+import AppKit
+import LiveSubCore
+
+/// The floating subtitle window: borderless, never takes focus, sits above full-screen video
+/// on every Space. Transparent except for the subtitle pill, so clicks elsewhere pass through.
+final class OverlayPanel: NSPanel {
+    static let frameKey = "LiveSub.overlayFrame"
+    let subtitleView: SubtitleView!
+
+    init(style: SubtitleStyle) {
+        subtitleView = SubtitleView(style: style)
+        super.init(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel, .resizable],
+                   backing: .buffered, defer: false)
+        isOpaque = false
+        backgroundColor = .clear
+        hasShadow = false
+        isFloatingPanel = true
+        // Above normal and full-screen windows, below menus and system alerts.
+        // (Set after isFloatingPanel, which resets the level to .floating.)
+        level = .statusBar
+        collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        hidesOnDeactivate = false
+        isMovableByWindowBackground = true
+        isReleasedWhenClosed = false
+        animationBehavior = .none
+        contentView = subtitleView
+        applyHeight(for: style)
+        restoreOrPlaceDefault()
+        NotificationCenter.default.addObserver(self, selector: #selector(frameChanged), name: NSWindow.didMoveNotification, object: self)
+        NotificationCenter.default.addObserver(self, selector: #selector(frameChanged), name: NSWindow.didEndLiveResizeNotification, object: self)
+    }
+
+    // Never steal keyboard focus from the video player.
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+
+    /// Height follows the style (lines × line height); the user controls width and position.
+    func applyHeight(for style: SubtitleStyle) {
+        let height = CGFloat(style.lineBudget) * style.lineHeight + style.padding.height * 2 + 8
+        contentMinSize = NSSize(width: 320, height: height)
+        contentMaxSize = NSSize(width: 10_000, height: height)
+        var f = frame
+        f.size.height = height
+        setFrame(f, display: true)
+    }
+
+    private func restoreOrPlaceDefault() {
+        if let saved = UserDefaults.standard.string(forKey: Self.frameKey) {
+            let rect = NSRectFromString(saved)
+            // Only reuse a saved frame that is still on a connected screen.
+            if rect.width >= 320, NSScreen.screens.contains(where: { $0.visibleFrame.intersects(rect) }) {
+                setFrame(NSRect(x: rect.minX, y: rect.minY, width: rect.width, height: frame.height), display: true)
+                return
+            }
+        }
+        placeDefault()
+    }
+
+    /// Bottom-center of the main screen, like movie subtitles.
+    func placeDefault() {
+        guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
+        let area = screen.visibleFrame
+        let width = min(max(area.width * 0.62, 480), 1400)
+        let origin = NSPoint(x: area.midX - width / 2, y: area.minY + area.height * 0.09)
+        setFrame(NSRect(origin: origin, size: NSSize(width: width, height: frame.height)), display: true)
+    }
+
+    @objc private func frameChanged() {
+        UserDefaults.standard.set(NSStringFromRect(frame), forKey: Self.frameKey)
+    }
+
+    var clickThrough: Bool {
+        get { ignoresMouseEvents }
+        set { ignoresMouseEvents = newValue }
+    }
+}
+
+/// Draws the last lines of the transcript in a rounded pill hugging the text.
+final class SubtitleView: NSView {
+    var style: SubtitleStyle { didSet { needsDisplay = true } }
+
+    /// One sentence as drawn: original text, how much of its end is still tentative, and its
+    /// translation (nil while it is on its way).
+    struct Row: Equatable {
+        var source: String
+        var tentativeCount = 0
+        var translation: String?
+        var isProvisional = false
+    }
+
+    private var rows: [Row] = []
+    /// Shown instead of subtitles (status messages such as "Listening…").
+    private var notice: String?
+    /// Outline of the whole window, shown while hovering or repositioning.
+    var showsFrame = false { didSet { needsDisplay = true } }
+    /// Called after each draw with the stamp passed to `update` (for latency measurement).
+    var onDrawn: ((UInt64) -> Void)?
+    private var pendingStamp: UInt64?
+    private var tracking: NSTrackingArea?
+
+    init(style: SubtitleStyle) {
+        self.style = style
+        super.init(frame: .zero)
+        wantsLayer = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isFlipped: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { true }
+
+    func update(rows: [Row], stamp: UInt64? = nil) {
+        self.rows = rows
+        notice = nil
+        if let stamp { pendingStamp = stamp }
+        needsDisplay = true
+        // Draw now rather than at the next display cycle, which can lag ~100 ms for a
+        // background app.
+        displayIfNeeded()
+    }
+
+    func showNotice(_ text: String?) {
+        notice = text
+        needsDisplay = true
+    }
+
+    var isEmpty: Bool { rows.isEmpty && notice == nil }
+
+    private func composed() -> NSAttributedString {
+        if let notice {
+            var attrs = style.attributes(volatile: true)
+            attrs[.font] = NSFont.systemFont(ofSize: max(14, style.fontSize * 0.6), weight: .medium)
+            return NSAttributedString(string: notice, attributes: attrs)
+        }
+        return compose(rows)
+    }
+
+    /// Lays the rows out for the current display mode.
+    func compose(_ rows: [Row]) -> NSAttributedString {
+        let out = NSMutableAttributedString()
+        func append(_ text: String, _ attrs: [NSAttributedString.Key: Any]) {
+            out.append(NSAttributedString(string: text, attributes: attrs))
+        }
+        /// Original text with its still-changing ending dimmed.
+        func appendSource(_ row: Row, dimAll: Bool = false) {
+            let dim = dimAll ? row.source.count : min(row.tentativeCount, row.source.count)
+            append(String(row.source.dropLast(dim)), style.attributes(volatile: false))
+            append(String(row.source.suffix(dim)), style.attributes(volatile: true))
+        }
+        /// Space between sentences, except between CJK characters.
+        func appendSeparator(before next: String) {
+            guard let a = out.string.unicodeScalars.last, let b = next.unicodeScalars.first else { return }
+            if !(SentenceSegmenter.isCJK(a) || SentenceSegmenter.isCJK(b)) { append(" ", style.attributes(volatile: false)) }
+        }
+        switch style.mode {
+        case .originalOnly:
+            // One flowing paragraph.
+            for row in rows {
+                appendSeparator(before: row.source)
+                appendSource(row)
+            }
+        case .translationOnly:
+            // One flowing paragraph of translations; a sentence that has no translation yet
+            // shows its original text dimmed so nothing is ever missing.
+            for row in rows {
+                let text = row.translation ?? row.source
+                appendSeparator(before: text)
+                if let t = row.translation {
+                    append(t, style.translationAttributes(provisional: row.isProvisional, primary: true))
+                } else {
+                    appendSource(row, dimAll: true)
+                }
+            }
+        case .both:
+            // Each sentence on its own line(s) with its translation directly beneath.
+            for (i, row) in rows.enumerated() {
+                if i > 0 { append("\n", style.attributes(volatile: false)) }
+                appendSource(row)
+                append("\n", style.attributes(volatile: false))
+                // The translation line is reserved with "…" so the layout does not jump when
+                // the translation arrives.
+                append(row.translation ?? "…", style.translationAttributes(provisional: row.translation == nil || row.isProvisional, primary: false))
+            }
+        }
+        return out
+    }
+
+    private var textWidth: CGFloat { bounds.width - style.padding.width * 2 - 8 }
+
+    /// Whether `rows` fit in the subtitle area without dropping lines.
+    func fits(_ rows: [Row]) -> Bool {
+        TailFitter.layout(compose(rows), width: textWidth).lines.count <= style.lineBudget
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        if showsFrame {
+            let outline = NSBezierPath(roundedRect: bounds.insetBy(dx: 1.5, dy: 1.5), xRadius: style.cornerRadius, yRadius: style.cornerRadius)
+            NSColor.black.withAlphaComponent(0.25).setFill()
+            outline.fill()
+            NSColor.white.withAlphaComponent(0.7).setStroke()
+            outline.lineWidth = 1.5
+            outline.setLineDash([6, 4], count: 2, phase: 0)
+            outline.stroke()
+        }
+        let available = textWidth
+        if let fitted = TailFitter.fit(composed(), width: available, maxLines: style.lineBudget), !fitted.lines.isEmpty {
+            // Pill hugs the text, centered, sitting on the bottom edge of the window.
+            let pillSize = NSSize(width: fitted.size.width + style.padding.width * 2,
+                                  height: fitted.size.height + style.padding.height * 2)
+            let pill = NSRect(x: (bounds.width - pillSize.width) / 2, y: bounds.height - pillSize.height - 4,
+                              width: pillSize.width, height: pillSize.height)
+            style.backgroundColor.withAlphaComponent(style.backgroundOpacity).setFill()
+            NSBezierPath(roundedRect: pill, xRadius: style.cornerRadius, yRadius: style.cornerRadius).fill()
+            fitted.draw(at: NSPoint(x: (bounds.width - available) / 2, y: pill.minY + style.padding.height))
+        }
+        if let stamp = pendingStamp {
+            pendingStamp = nil
+            onDrawn?(stamp)
+        }
+    }
+
+    // MARK: Hover shows the frame so the window can be found, dragged and resized.
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self)
+        addTrackingArea(area)
+        tracking = area
+    }
+
+    var hoverChanged: ((Bool) -> Void)?
+    override func mouseEntered(with event: NSEvent) { hoverChanged?(true) }
+    override func mouseExited(with event: NSEvent) { hoverChanged?(false) }
+
+    /// PNG of the current contents over a mid-gray backdrop (used for automated visual checks).
+    func snapshotPNG() -> Data? {
+        guard bounds.width > 0, let rep = bitmapImageRepForCachingDisplay(in: bounds) else { return nil }
+        cacheDisplay(in: bounds, to: rep)
+        let image = NSImage(size: bounds.size)
+        image.lockFocus()
+        NSColor(calibratedWhite: 0.45, alpha: 1).setFill()
+        bounds.fill()
+        rep.draw(in: bounds)
+        image.unlockFocus()
+        guard let tiff = image.tiffRepresentation, let out = NSBitmapImageRep(data: tiff) else { return nil }
+        return out.representation(using: .png, properties: [:])
+    }
+}
