@@ -9,6 +9,8 @@ BIN="$(swift build -c "$CONFIG" --show-bin-path)/livesub"
 APP=build/LiveSub.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+# Keep Spotlight from listing this build copy next to the installed app.
+touch build/.metadata_never_index
 cp "$BIN" "$APP/Contents/MacOS/livesub"
 cp Resources/Info.plist "$APP/Contents/Info.plist"
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
