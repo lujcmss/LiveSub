@@ -56,7 +56,9 @@ struct SettingsView: View {
                         Text(language.displayName).tag(language.id)
                     }
                 }
-                Text("Translation runs on this Mac. A language pair that isn't installed yet asks once to download.")
+                Toggle("Finish sentences at pauses (faster, slightly less accurate)", isOn: $settings.fasterSentences)
+                Toggle("Translate while a sentence is still being spoken", isOn: $settings.translateWhileSpeaking)
+                Text("A translation appears once its sentence is complete, about a second after it ends. Finishing sentences at pauses brings that forward by about 0.3 s but can mishear the first word after a pause. Translating while speaking shows a running translation that is revised as the sentence grows. Translation runs on this Mac; a language pair that isn't installed yet asks once to download.")
                     .font(.footnote).foregroundStyle(.secondary)
             }
             Section("Behavior") {

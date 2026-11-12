@@ -52,7 +52,7 @@ final class ConsoleRenderer: @unchecked Sendable {
             clearPartial()
             let tag = latency.map { String(format: "  [final %.0f ms after last word]", $0) } ?? ""
             print("✓ \(text)\(isTTY ? "\u{1B}[2m\(tag)\u{1B}[0m" : tag)")
-        case .sentence:
+        case .sentence, .sentenceBreak:
             break
         }
     }

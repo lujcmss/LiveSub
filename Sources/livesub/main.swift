@@ -75,6 +75,10 @@ struct Options {
     var pauseFor: Double = 0
     var pauseSilence = false
     var delete: String?
+    var rewindAt: Double?
+    var rewindBy: Double = 0
+    var eager = false
+    var commitAtPauses = false
 }
 
 func parse(_ args: [String]) -> Options {
@@ -110,6 +114,10 @@ func parse(_ args: [String]) -> Options {
         case "--pause-for": o.pauseFor = Double(val()) ?? 0
         case "--pause-silence": o.pauseSilence = true
         case "--delete": o.delete = val()
+        case "--rewind-at": o.rewindAt = Double(val())
+        case "--rewind-by": o.rewindBy = Double(val()) ?? 0
+        case "--translate-while-speaking": o.eager = true
+        case "--finish-at-pauses": o.commitAtPauses = true
         case "--idle-seconds": o.idleSeconds = Double(val())
         case "--snapshot": o.snapshot = (val() as NSString).expandingTildeInPath
         case "--out": o.out = URL(fileURLWithPath: (val() as NSString).expandingTildeInPath)
@@ -367,6 +375,10 @@ MainActor.assumeIsolated {
             config.filePauseAt = opts.pauseAt
             config.filePauseFor = opts.pauseFor
             config.filePauseSilence = opts.pauseSilence
+            config.fileRewindAt = opts.rewindAt
+            config.fileRewindBy = opts.rewindBy
+            if opts.eager { settings.translateWhileSpeaking = true }
+            if opts.commitAtPauses { settings.fasterSentences = true }
             config.snapshotDirectory = opts.snapshot.map { URL(fileURLWithPath: $0) }
             config.quitAfter = opts.secondsSet ? opts.seconds : nil
             runOverlayApp(settings: settings, config: config)

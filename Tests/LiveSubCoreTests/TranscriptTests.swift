@@ -425,14 +425,14 @@ private func fin(_ t: String, _ a: Double, _ b: Double) -> ASRResult { ASRResult
 
     @Test func reportsOncePerPauseAfterEnoughSpeech() {
         let speech = [Float](repeating: -20, count: 10), gap = [Float](repeating: -60, count: 8)
-        // The pause is reported on its third quiet chunk (0.3 s), and only once.
-        #expect(pauses(speech + gap + speech + gap) == [12, 30])
+        // The pause is reported on its fourth quiet chunk (0.4 s), and only once.
+        #expect(pauses(speech + gap + speech + gap) == [13, 31])
     }
 
     @Test func musicUnderSpeechStillCountsAsAPause() {
         // Speech at -18 dB over music at -36 dB: the drop is what matters, not silence.
         let speech = [Float](repeating: -18, count: 10), music = [Float](repeating: -36, count: 6)
-        #expect(pauses(speech + music) == [12])
+        #expect(pauses(speech + music) == [13])
     }
 
     @Test func ignoresBlipsAndSteadyNoise() {
@@ -442,5 +442,53 @@ private func fin(_ t: String, _ a: Double, _ b: Double) -> ASRResult { ASRResult
         #expect(pauses([Float](repeating: -30, count: 40)).isEmpty)
         // Quiet before any speech: nothing to commit.
         #expect(pauses([Float](repeating: -70, count: 20)).isEmpty)
+    }
+}
+
+@Suite struct RewindMatchingTests {
+    private func noise(_ count: Int, seed: UInt64) -> [UInt32] {
+        var x = seed
+        return (0..<count).map { _ in
+            x = x &* 6364136223846793005 &+ 1442695040888963407
+            return UInt32(truncatingIfNeeded: x >> 32) | 1
+        }
+    }
+
+    private func corrupt(_ frames: [UInt32], rate: Double, seed: UInt64) -> [UInt32] {
+        var x = seed
+        return frames.map { f in
+            var out = f
+            for bit in 0..<32 {
+                x = x &* 6364136223846793005 &+ 1442695040888963407
+                if Double(x >> 40) / Double(1 << 24) < rate { out ^= 1 << UInt32(bit) }
+            }
+            return out == 0 ? 1 : out
+        }
+    }
+
+    @Test func referencesCanGrowWhileMatching() {
+        let audio = noise(3000, seed: 11)
+        var m = SessionMatcher()
+        // The current session becomes matchable piece by piece, as ReplaySync feeds it.
+        m.extend(id: "now", with: Array(audio[0..<1000]))
+        m.extend(id: "now", with: Array(audio[1000..<2000]))
+        // The viewer skips back to frame 600 of what was just heard.
+        m.append(Array(audio[600..<900]))
+        #expect(m.state == .locked(id: "now", delta: 600))
+    }
+
+    @Test func noisyReplayStillLocksQuickly() {
+        // 20% of bits wrong: almost no frame matches exactly, so plain index lookup finds
+        // nothing; one-bit probing and the exhaustive pass must carry it.
+        let saved = noise(6000, seed: 21)
+        var m = SessionMatcher(references: [.init(id: "a", fingerprints: saved)])
+        m.append(corrupt(Array(saved[4000..<4200]), rate: 0.20, seed: 5))
+        #expect(m.state == .locked(id: "a", delta: 4000))
+    }
+
+    @Test func unrelatedAudioStillNeverLocksWithTolerantSearch() {
+        var m = SessionMatcher(references: [.init(id: "a", fingerprints: noise(6000, seed: 21))])
+        m.append(noise(1500, seed: 99))
+        #expect(m.state == .searching)
     }
 }

@@ -123,6 +123,21 @@ after seeks. Measured:
 | Saved subtitle on screen relative to the start of its speech | 85 ms early (p95 60 ms early) |
 | Pause for 3 s (silence or no audio at all), then resume | stays in sync |
 
+## Skipping back
+
+The session being watched is matched against itself too: audio becomes findable about 5 s
+after it was heard. Skip back 10 seconds and LiveSub recognizes the stretch about a second
+later, commits whatever the recognizer still held as tentative, and shows the saved sentences
+and translations on time. Text heard during a replay is not saved twice, and a recognizer
+result that runs across the jump is trimmed to its new words. Measured on a recording
+(skip back 9 s): back in sync 1.0 s after the jump; saved subtitle 80 ms early.
+
+To keep saved text fresh, the pipeline asks the recognizer to commit after 9 s without a final
+result. Committing at every pause is available as a setting ("Finish sentences at pauses"):
+it marks sentences complete about 0.45 s sooner and shows translations about 0.3 s sooner, but
+the recognizer loses its look-ahead and context, which cost a correctly heard word on the test
+recording, so it is off by default.
+
 ## Translation
 
 ```bash
@@ -150,8 +165,16 @@ Only. Simplified and Traditional Chinese are separate targets.
   `open -n build/LiveSub.app --args translation-setup --lang ja-JP,ko-KR --to en,zh-Hans,zh-Hant`.
   Tested: Japanese, Korean, Spanish and French into English and Simplified Chinese.
 - **No waiting for finals.** A sentence is translated the moment its closing punctuation
-  appears in the partial text, and the sentence still being spoken gets a dimmed provisional
-  translation that refreshes as it grows. A revised sentence is simply translated again.
+  appears in the partial text. A revised sentence is simply translated again.
+- **Whole sentences by default.** A translation is shown once its sentence is complete.
+  "Translate while a sentence is still being spoken" (Settings) adds a running translation that
+  refreshes as the sentence grows.
+- **Reading time.** When only one sentence fits, a finished translation stays for a reading
+  time (1 s plus 60 ms per character, up to 3 s) before the next sentence replaces it.
+
+Where the time goes, measured on live Netflix playback (Japanese → Chinese): a word appears
+0.77 s after it is spoken; the recognizer marks the sentence complete 0.3 s after that;
+translating takes 0.07 s. The recognizer is the bottleneck, not translation.
 
 macOS lets an app keep only 5 speech languages reserved for offline use; `livesub languages`
 shows which are kept, and LiveSub releases the least recently used one when a sixth is needed.

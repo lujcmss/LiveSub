@@ -23,6 +23,9 @@ public final class FileAudioSource: AudioSource, @unchecked Sendable {
     public var pauseAt: Double?
     public var pauseFor: Double = 0
     public var pauseDeliversSilence = false
+    /// Simulate the viewer skipping back: at `rewindAt` seconds of playback, jump back `rewindBy`.
+    public var rewindAt: Double?
+    public var rewindBy: Double = 0
 
     public init(url: URL, bufferDuration: Double = 0.01) {
         self.url = url
@@ -41,8 +44,13 @@ public final class FileAudioSource: AudioSource, @unchecked Sendable {
         queue.async { [self] in
             var startHost = firstHost
             var pause = pauseAt
+            var rewind = rewindAt
             var position: Double = 0
             while !stopped, audioFile.framePosition < audioFile.length {
+                if let at = rewind, position >= at {
+                    rewind = nil
+                    audioFile.framePosition = max(0, audioFile.framePosition - AVAudioFramePosition(rewindBy * fmt.sampleRate))
+                }
                 if let at = pause, position >= at {
                     pause = nil
                     if pauseDeliversSilence {

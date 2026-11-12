@@ -17,6 +17,14 @@ final class AppSettings: ObservableObject {
     /// Translation target ("en", "zh-Hans", …) or "none".
     @Published var targetLanguage: String { didSet { save("targetLanguage", targetLanguage) } }
 
+    /// Show a provisional translation while a sentence is still being spoken (off: wait for
+    /// the whole sentence).
+    @Published var translateWhileSpeaking: Bool { didSet { save("translateWhileSpeaking", translateWhileSpeaking) } }
+
+    /// End sentences at pauses in speech: translations come about 0.3 s sooner, recognition is
+    /// slightly less accurate.
+    @Published var fasterSentences: Bool { didSet { save("fasterSentences", fasterSentences) } }
+
     // Appearance
     @Published var displayMode: SubtitleStyle.DisplayMode { didSet { save("displayMode", displayMode.rawValue) } }
     @Published var fontName: String { didSet { save("fontName", fontName) } }
@@ -46,6 +54,8 @@ final class AppSettings: ObservableObject {
         let language = string("sourceLanguage", "ja-JP")
         sourceLanguage = language
         targetLanguage = string("targetLanguage", AppleTranslator.defaultTarget(for: TranslationLanguage(speechLocale: language)).id)
+        translateWhileSpeaking = bool("translateWhileSpeaking", false)
+        fasterSentences = bool("fasterSentences", false)
         displayMode = SubtitleStyle.DisplayMode(rawValue: string("displayMode", "")) ?? .both
         fontName = string("fontName", style.fontName)
         fontSize = double("fontSize", Double(style.fontSize))

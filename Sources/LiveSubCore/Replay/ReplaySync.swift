@@ -6,11 +6,21 @@ import Foundation
 /// Thread-safe: `ingest` is called from the audio queue, everything else from the main thread.
 public final class ReplaySync: @unchecked Sendable {
     public struct Position: Sendable {
-        public let session: SubtitleSession
-        /// Seconds into the saved session that are playing right now.
+        /// The saved session being replayed, or nil when it is the session being recorded now
+        /// (the viewer skipped back): see `currentSessionID`.
+        public let session: SubtitleSession?
+        public let sessionID: String
+        /// Seconds into that session that are playing right now.
         public let time: Double
         public let isPaused: Bool
     }
+
+    /// ID under which this run's own audio is matched (for skipping back within the run).
+    public let currentSessionID: String
+    /// Audio becomes matchable this long after it was heard. It must exceed the matching window
+    /// so that live audio can never match itself.
+    static let selfMatchDelayFrames = 320   // about 5 s
+    private var matchable = 0
 
     /// Called (on the audio queue) when the matcher locks, pauses, resumes or loses the audio.
     public var onStateChange: (@Sendable (SessionMatcher.State) -> Void)?
@@ -24,7 +34,8 @@ public final class ReplaySync: @unchecked Sendable {
     private var lastChunkEnd: UInt64 = 0
     private var unmatchedFrames = 0
 
-    public init(sessions: [SubtitleSession]) {
+    public init(sessions: [SubtitleSession], currentSessionID: String = UUID().uuidString) {
+        self.currentSessionID = currentSessionID
         matcher = SessionMatcher(references: sessions.map { .init(id: $0.id, fingerprints: $0.fingerprints) })
         for s in sessions { self.sessions[s.id] = s }
     }
@@ -36,8 +47,30 @@ public final class ReplaySync: @unchecked Sendable {
         samplesFed += Int(chunk.buffer.frameLength)
         lastChunkEnd = chunk.endHostTime
         recorded.append(contentsOf: frames)
+        // Make our own audio from a few seconds ago findable (for skipping back).
+        let ready = recorded.count - Self.selfMatchDelayFrames
+        if ready > matchable {
+            matcher.extend(id: currentSessionID, with: Array(recorded[matchable..<ready]))
+            matchable = ready
+        }
         let changed = matcher.append(frames)
-        if case .searching = matcher.state { unmatchedFrames += frames.count }
+        if case .searching = matcher.state {
+            unmatchedFrames += frames.count
+            if replayStart != nil { endReplayInterval() }
+        } else {
+            // Audio that is itself a replay must not be saved again: blank it in the recording
+            // (including the stretch it took to recognize it), and remember when it happened so
+            // captions from it are skipped too.
+            if replayStart == nil {
+                // The replay began where the audio started agreeing with the saved session.
+                // (Frame numbers here count from the start of the run, like `recorded`.)
+                let first = max(matchable, min(recorded.count, matcherFrameOffset + matcher.lockStartFrame - 8))
+                replayStart = Double(first) * AudioFingerprinter.hopSeconds
+                for i in first..<recorded.count { recorded[i] = AudioFingerprinter.silent }
+            } else {
+                for i in max(matchable, recorded.count - frames.count)..<recorded.count { recorded[i] = AudioFingerprinter.silent }
+            }
+        }
         let state = matcher.state
         lock.unlock()
         if changed { onStateChange?(state) }
@@ -55,10 +88,11 @@ public final class ReplaySync: @unchecked Sendable {
         case .searching:
             return nil
         case let .paused(id, frame):
-            guard let session = sessions[id] else { return nil }
-            return Position(session: session, time: Double(frame) * AudioFingerprinter.hopSeconds, isPaused: true)
+            guard sessions[id] != nil || id == currentSessionID else { return nil }
+            return Position(session: sessions[id], sessionID: id, time: Double(frame) * AudioFingerprinter.hopSeconds, isPaused: true)
         case let .locked(id, delta):
-            guard let session = sessions[id] else { return nil }
+            guard sessions[id] != nil || id == currentSessionID else { return nil }
+            let session = sessions[id]
             // The newest live sample corresponds to this saved time; then run on the clock.
             // After a pause the matcher restarts its frame count, so use its own frame position.
             let liveFrames = matcher.liveFrameCount
@@ -68,7 +102,7 @@ public final class ReplaySync: @unchecked Sendable {
             // Run on the clock between chunks (they arrive every ~100 ms). If audio stops
             // arriving altogether (the player was paused), stop the clock too.
             let sinceChunk = max(0, HostClock.ms(from: lastChunkEnd, to: now) / 1000)
-            return Position(session: session, time: newestSample + min(sinceChunk, 0.15), isPaused: sinceChunk > 0.35)
+            return Position(session: session, sessionID: id, time: newestSample + min(sinceChunk, 0.15), isPaused: sinceChunk > 0.35)
         }
     }
 
@@ -77,6 +111,42 @@ public final class ReplaySync: @unchecked Sendable {
     public var diagnostics: (lockedErrorRate: Double, searchBest: Double?) {
         lock.lock(); defer { lock.unlock() }
         return (matcher.lastErrorRate, matcher.lastSearchBest)
+    }
+
+    /// The matcher restarts its frame count after a pause; this keeps it comparable with
+    /// `recorded`.
+    private var matcherFrameOffset: Int { recorded.count - matcher.liveFrameCount }
+
+    /// Seconds of the most recent audio that belong to the replay now in progress.
+    public var secondsSinceReplayBegan: Double? {
+        lock.lock(); defer { lock.unlock() }
+        guard let start = replayStart else { return nil }
+        return Double(recorded.count) * AudioFingerprinter.hopSeconds - start
+    }
+
+    private var replayStart: Double?
+    private var replayIntervals: [ClosedRange<Double>] = []
+
+    private func endReplayInterval() {
+        guard let start = replayStart else { return }
+        // The last few frames before the lock was dropped were already new audio.
+        let end = Double(max(0, recorded.count - matcher.unlockLagFrames)) * AudioFingerprinter.hopSeconds
+        replayIntervals.append(start...max(start, end))
+        replayStart = nil
+    }
+
+    /// Whether the audio at `streamSeconds` of this run was a replay of something already saved.
+    public func wasReplay(at streamSeconds: Double) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if let start = replayStart, streamSeconds >= start { return true }
+        return replayIntervals.contains { $0.contains(streamSeconds) }
+    }
+
+    /// Whether a replay ended within `window` seconds before `streamSeconds` (the first words
+    /// after a replay are usually the cut-off tail of a sentence).
+    public func replayEnded(shortlyBefore streamSeconds: Double, within window: Double = 1.5) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return replayIntervals.contains { streamSeconds >= $0.upperBound && streamSeconds - $0.upperBound <= window }
     }
 
     // MARK: Recording

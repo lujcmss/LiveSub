@@ -40,6 +40,8 @@ public struct SessionMatcher: Sendable {
         public var stride = 16
         /// Quiet live frames (while the saved audio is not quiet) that mean "paused": 0.4 s.
         public var pauseFrames = 25
+        /// Live frames with sound where the saved audio has none that mean "past the end": 0.35 s.
+        public var orphanFrames = 22
         public init() {}
     }
 
@@ -72,6 +74,26 @@ public struct SessionMatcher: Sendable {
         references[reference.id] = reference.fingerprints
         for (frame, value) in reference.fingerprints.enumerated() where value != AudioFingerprinter.silent {
             index[value, default: []].append((s, Int32(frame)))
+        }
+    }
+
+    /// Append frames to a reference (creating it if needed). Used for the session being
+    /// recorded right now, so that skipping back finds the audio heard a moment ago.
+    public mutating func extend(id: String, with frames: [UInt32]) {
+        guard !frames.isEmpty else { return }
+        let s: Int32
+        if let existing = referenceIDs.firstIndex(of: id) {
+            s = Int32(existing)
+        } else {
+            s = Int32(referenceIDs.count)
+            referenceIDs.append(id)
+            references[id] = []
+        }
+        var base = references[id]!.count
+        references[id]!.append(contentsOf: frames)
+        for value in frames {
+            if value != AudioFingerprinter.silent { index[value, default: []].append((s, Int32(base))) }
+            base += 1
         }
     }
 
@@ -130,10 +152,17 @@ public struct SessionMatcher: Sendable {
             } else {
                 quietRun = 0
             }
-            if savedIndex >= saved.count + tuning.lockWindow {
-                // Ran past the end of the saved session.
-                unlock()
-                return
+            // The opposite of a pause: we hear sound where nothing was saved. Playback has run
+            // past the end of the saved audio (or past the point the viewer skipped back from).
+            if frame != AudioFingerprinter.silent, savedIsQuiet {
+                orphanRun += 1
+                if orphanRun >= tuning.orphanFrames {
+                    unlockLagFrames = orphanRun
+                    unlock()
+                    return
+                }
+            } else if frame != AudioFingerprinter.silent {
+                orphanRun = 0
             }
         }
         guard sinceCheck >= tuning.stride else { return }
@@ -148,7 +177,13 @@ public struct SessionMatcher: Sendable {
     /// True right after resuming from a pause, until the first successful check.
     private var resumed = false
 
+    private var orphanRun = 0
+    /// How many of the most recent frames were already past the end of the match when the lock
+    /// was dropped (they belong to new audio, not to the replay).
+    public private(set) var unlockLagFrames = 0
+
     private mutating func unlock() {
+        orphanRun = 0
         state = .searching
         failures = 0
         quietRun = 0
@@ -159,18 +194,23 @@ public struct SessionMatcher: Sendable {
     /// correspond to under `delta`. nil if too few frames have sound on both sides.
     private func errorRate(saved: [UInt32], delta: Int, window: Int) -> Double? {
         let count = min(window, live.count)
-        var bits = 0, valid = 0
+        var bits = 0, valid = 0, orphans = 0
         let firstLive = live.count - count
         for i in 0..<count {
             let s = liveBase + firstLive + i + delta
             guard s >= 0, s < saved.count else { continue }
             let a = live[firstLive + i], b = saved[s]
+            if a != AudioFingerprinter.silent, b == AudioFingerprinter.silent { orphans += 1 }
             guard a != AudioFingerprinter.silent, b != AudioFingerprinter.silent else { continue }
             bits += (a ^ b).nonzeroBitCount
             valid += 1
         }
         let needed = resumed ? min(tuning.minimumValid, 20) : tuning.minimumValid
-        guard valid >= needed else { return nil }
+        guard valid >= needed else {
+            // We hear sound where the saved session has none: that is a mismatch, not a lack
+            // of evidence (e.g. playback ran past the end of what was saved).
+            return orphans >= needed ? 0.5 : nil
+        }
         return Double(bits) / Double(valid * 32)
     }
 
@@ -182,11 +222,24 @@ public struct SessionMatcher: Sendable {
         let firstLive = live.count - count
         for i in 0..<count {
             let value = live[firstLive + i]
-            guard value != AudioFingerprinter.silent, let hits = index[value], hits.count < 2000 else { continue }
-            for (s, frame) in hits {
-                let delta = Int(frame) - (liveBase + firstLive + i)
-                votes[Int64(s) << 40 | Int64(delta + (1 << 30)), default: 0] += 1
+            guard value != AudioFingerprinter.silent else { continue }
+            // Look up the value itself and every one-bit variation of it: a stream replayed at
+            // a different quality rarely reproduces all 32 bits of a frame exactly.
+            for bit in -1..<32 {
+                let probe = bit < 0 ? value : value ^ (1 << UInt32(bit))
+                guard let hits = index[probe], hits.count < 2000 else { continue }
+                for (s, frame) in hits {
+                    let delta = Int(frame) - (liveBase + firstLive + i)
+                    votes[Int64(s) << 40 | Int64(delta + (1 << 30)), default: 0] += bit < 0 ? 3 : 1
+                }
             }
+        }
+        searches += 1
+        // Every couple of seconds, also compare against everything directly: this finds audio
+        // too degraded for the index. (Kept infrequent and bounded so a large library of saved
+        // sessions costs about 1% of a core.)
+        if searches % 8 == 0, let found = exhaustiveSearch() {
+            votes[Int64(found.session) << 40 | Int64(found.delta + (1 << 30)), default: 0] += 1000
         }
         // Check the most-voted alignments properly.
         let candidates = votes.sorted { $0.value > $1.value }.prefix(8)
@@ -197,6 +250,9 @@ public struct SessionMatcher: Sendable {
             guard let saved = references[id] else { continue }
             // Neighbouring alignments can score better than the voted one by a frame.
             for d in (delta - 1)...(delta + 1) {
+                // An alignment whose newest audio falls where nothing was saved is one we have
+                // already played past: older frames still agree, but it is over.
+                guard !isPastEnd(saved: saved, delta: d) else { continue }
                 if let rate = errorRate(saved: saved, delta: d, window: tuning.lockWindow), rate < (best?.rate ?? tuning.lockThreshold) {
                     best = (id, d, rate)
                 }
@@ -215,7 +271,87 @@ public struct SessionMatcher: Sendable {
             lastErrorRate = best.rate
             failures = 0
             quietRun = 0
+            lockStartFrame = matchStart(id: best.id, delta: best.delta)
         }
+    }
+
+    private var searches = 0
+
+    /// Whether, under `delta`, the most recent live frames with sound all fall where the saved
+    /// session has none.
+    private func isPastEnd(saved: [UInt32], delta: Int) -> Bool {
+        var sounding = 0, orphans = 0
+        for i in stride(from: live.count - 1, through: max(0, live.count - tuning.orphanFrames * 2), by: -1) {
+            guard live[i] != AudioFingerprinter.silent else { continue }
+            sounding += 1
+            let s = liveBase + i + delta
+            if s < 0 || s >= saved.count || saved[s] == AudioFingerprinter.silent { orphans += 1 }
+            if sounding >= tuning.orphanFrames { break }
+        }
+        return sounding >= tuning.orphanFrames / 2 && orphans * 5 >= sounding * 4
+    }
+
+    /// Live frame at which the audio began to follow the current lock's alignment: where the
+    /// viewer jumped (found by walking back from now until the audio stops agreeing).
+    public private(set) var lockStartFrame = 0
+
+    private func matchStart(id: String, delta: Int) -> Int {
+        guard let saved = references[id] else { return liveFrameCount }
+        var earliest = live.count
+        var misses = 0
+        for i in stride(from: live.count - 1, through: 0, by: -1) {
+            let s = liveBase + i + delta
+            guard s >= 0, s < saved.count else { break }
+            let a = live[i], b = saved[s]
+            if a == AudioFingerprinter.silent || b == AudioFingerprinter.silent {
+                // Silence on both sides is consistent; sound on one side only is not.
+                if a != b { misses += 1 } else { continue }
+            } else if (a ^ b).nonzeroBitCount <= 11 {
+                earliest = i
+                misses = 0
+                continue
+            } else {
+                misses += 1
+            }
+            if misses >= 6 { break }
+        }
+        return liveBase + earliest
+    }
+
+    /// Slide the recent live audio along every saved session, using a sample of its frames,
+    /// and return the best alignment if it is clearly not chance.
+    private func exhaustiveSearch() -> (session: Int, delta: Int)? {
+        let count = min(tuning.lockWindow, live.count)
+        let firstLive = live.count - count
+        // Up to 40 evenly spread non-silent live frames.
+        let candidates = (0..<count).filter { live[firstLive + $0] != AudioFingerprinter.silent }
+        guard candidates.count >= tuning.minimumValid else { return nil }
+        let step = max(1, candidates.count / 40)
+        let sample = stride(from: 0, to: candidates.count, by: step).map { candidates[$0] }
+        var best: (session: Int, delta: Int, rate: Double)?
+        var budget = 600_000   // frames examined per pass: about 2.5 hours of saved audio
+        // Newest sessions first (the one being recorded is last in the list).
+        for (s, id) in referenceIDs.enumerated().reversed() {
+            guard budget > 0, let saved = references[id], saved.count > count else { continue }
+            budget -= saved.count
+            saved.withUnsafeBufferPointer { savedPtr in
+                for start in 0...(saved.count - count) {
+                    var bits = 0, valid = 0
+                    for offset in sample {
+                        let b = savedPtr[start + offset]
+                        guard b != AudioFingerprinter.silent else { continue }
+                        bits += (live[firstLive + offset] ^ b).nonzeroBitCount
+                        valid += 1
+                    }
+                    guard valid >= sample.count / 2, valid >= 16 else { continue }
+                    let rate = Double(bits) / Double(valid * 32)
+                    if rate < (best?.rate ?? tuning.lockThreshold) {
+                        best = (s, start - (liveBase + firstLive), rate)
+                    }
+                }
+            }
+        }
+        return best.map { ($0.session, $0.delta) }
     }
 
     /// Closest bit error rate found by the last search (nil: nothing even resembled the audio).
@@ -250,7 +386,10 @@ public struct SessionMatcher: Sendable {
             }
         } else if comparable {
             failures += 1
-            if failures >= tuning.failuresToUnlock { unlock() }
+            if failures >= tuning.failuresToUnlock {
+                unlockLagFrames = failures * tuning.stride + tuning.checkWindow / 2
+                unlock()
+            }
         }
         // Not comparable (mostly silence): keep the lock and wait for sound.
     }

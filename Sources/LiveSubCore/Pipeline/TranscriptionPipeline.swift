@@ -14,6 +14,9 @@ public final class TranscriptionPipeline: @unchecked Sendable {
         case final(text: String, runs: [ASRResult.TimedRun], latencyMS: Double?, receivedHostTime: UInt64)
         /// A complete sentence is available (what translation will consume).
         case sentence(String)
+        /// Speech paused (or playback jumped) here: whatever sentence was in progress is over,
+        /// even if the recognizer gave it no closing punctuation.
+        case sentenceBreak
     }
 
     public enum Stage {
@@ -25,7 +28,6 @@ public final class TranscriptionPipeline: @unchecked Sendable {
         public static let final = "3 word spoken → final text"
         public static let finalFromStart = "3b phrase start → final text"
         public static let display = "4 recognizer output → drawn on screen"
-        public static let pauseFinalize = "(pauses that triggered an early commit)"
     }
 
     public let stats: LatencyStats
@@ -38,13 +40,51 @@ public final class TranscriptionPipeline: @unchecked Sendable {
     /// Audio that arrives while the recognizer is still starting is fed once it is ready.
     private var accepting = false
     private var sawAudio = false
-    /// Commit pending text as soon as the speaker pauses, instead of waiting for the
-    /// recognizer to do it on its own schedule. Off by default: measured on a recording it
-    /// brought final text forward (p95 953 → 396 ms after the last word) but did not make
-    /// sentences complete, or their translations appear, any sooner, and it risks cutting a
-    /// sentence at a short pause. Enable with LIVESUB_PAUSE_COMMIT=1 to experiment.
-    public var finalizeAtPauses = ProcessInfo.processInfo.environment["LIVESUB_PAUSE_COMMIT"] != nil
+    /// In continuous dialogue the recognizer can hold text as "not final" for 10-15 s. Final
+    /// text is what gets saved (with accurate timing) for replay, so that is too stale for a
+    /// viewer who skips back a few seconds: after `commitLimit` seconds uncommitted, the
+    /// pipeline asks for a commit.
+    ///
+    /// `commitAtPauses` goes further and commits at every pause in speech (once `commitAfter`
+    /// seconds are pending), ending the sentence there. Measured on recordings this marks
+    /// sentences complete about 0.45 s sooner (0.9 s → 0.44 s after the last word) and shows
+    /// their translation about 0.3 s sooner, because the recognizer gives up its look-ahead.
+    /// The price is accuracy: it also starts the next phrase without context, and on the test
+    /// recording that turned a correctly heard word into a wrong one. Off by default.
+    public var commitAtPauses = false
+    public var commitAfter: Double = 1.5
+    public var commitLimit: Double = 9
+    /// Stream times of commits that should also end the sentence in progress.
+    private var pendingBreaks: [Double] = []
     private var pauses = PauseDetector()
+    private let commitLock = NSLock()
+    /// Stream time (seconds fed) up to which text has been committed.
+    private var committedThrough: Double = 0
+
+    /// Ask the recognizer to finalize everything heard so far (e.g. the viewer just skipped
+    /// back and the last few seconds are about to be replayed).
+    /// - Parameter endsSentence: treat this point as the end of the sentence in progress.
+    public func commitNow(secondsBack: Double = 0, endsSentence: Bool = false) {
+        commitLock.lock()
+        committedThrough = timeline.secondsFed - secondsBack
+        if endsSentence { pendingBreaks.append(committedThrough) }
+        commitLock.unlock()
+        backend.finalizePending(secondsBack: secondsBack)
+    }
+
+    /// Whether a final result ending at `audioEnd` reaches a commit that ends a sentence.
+    private func takeBreak(upTo audioEnd: Double) -> Bool {
+        commitLock.lock(); defer { commitLock.unlock() }
+        let reached = pendingBreaks.filter { $0 <= audioEnd + 0.35 }
+        pendingBreaks.removeAll { $0 <= audioEnd + 0.35 }
+        return !reached.isEmpty
+    }
+
+    private func noteCommitted(through seconds: Double) {
+        commitLock.lock()
+        committedThrough = max(committedThrough, seconds)
+        commitLock.unlock()
+    }
     /// Called on the audio queue with every chunk fed to the recognizer (set before `run`).
     public var onChunk: (@Sendable (AudioChunk) -> Void)?
 
@@ -89,6 +129,7 @@ public final class TranscriptionPipeline: @unchecked Sendable {
                 words.sawPartial(assembler.volatileText, at: r.receivedHostTime)
                 onEvent(.partial(text: assembler.volatileText, latencyMS: latency, receivedHostTime: r.receivedHostTime))
             case let .finalized(segment):
+                noteCommitted(through: r.audioEnd)
                 if let latency { stats.record(Stage.final, ms: latency) }
                 for ms in words.finalized(runs: r.timedRuns, at: r.receivedHostTime, captureTime: { self.timeline.hostTime(at: $0) }) {
                     stats.record(Stage.word, ms: ms)
@@ -98,6 +139,10 @@ public final class TranscriptionPipeline: @unchecked Sendable {
                 }
                 onEvent(.final(text: segment.text, runs: r.timedRuns, latencyMS: latency, receivedHostTime: r.receivedHostTime))
                 for s in segmenter.append(segment.text) { onEvent(.sentence(s)) }
+                if takeBreak(upTo: r.audioEnd) {
+                    if let tail = segmenter.flush() { onEvent(.sentence(tail)) }
+                    onEvent(.sentenceBreak)
+                }
                 assembler.trim(keepingLast: 120)
             }
         }
@@ -114,9 +159,14 @@ public final class TranscriptionPipeline: @unchecked Sendable {
             let duration = Double(chunk.buffer.frameLength) / chunk.buffer.format.sampleRate
             timeline.append(duration: duration, startHostTime: chunk.startHostTime)
             backend.feed(chunk.buffer)
-            if pauses.note(levelDB: chunk.levelDB, duration: duration), finalizeAtPauses {
-                backend.finalizePending()
-                stats.record(Stage.pauseFinalize, ms: 0)
+            let paused = pauses.note(levelDB: chunk.levelDB, duration: duration)
+            commitLock.lock()
+            let uncommitted = timeline.secondsFed - committedThrough
+            commitLock.unlock()
+            if commitAtPauses, paused, uncommitted >= commitAfter {
+                commitNow(endsSentence: true)
+            } else if uncommitted >= commitLimit {
+                commitNow()
             }
             onChunk?(chunk)
             stats.record(Stage.capture, ms: HostClock.ms(from: chunk.endHostTime, to: HostClock.now()))
@@ -137,7 +187,7 @@ public final class TranscriptionPipeline: @unchecked Sendable {
 public struct PauseDetector: Sendable {
     /// How far below the recent peak counts as a pause (dB), and for how long (seconds).
     public var drop: Float = 14
-    public var hold: Double = 0.3
+    public var hold: Double = 0.4
     /// Speech needed since the last pause before another one is reported (seconds).
     public var minimumSpeech: Double = 0.5
 

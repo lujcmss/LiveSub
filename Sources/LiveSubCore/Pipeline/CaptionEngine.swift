@@ -92,7 +92,7 @@ public final class CaptionEngine {
                 return Row(source: source, translation: t, isProvisional: false, isComplete: complete)
             }
             // Unfinished last sentence: show the eager translation if it is for a prefix of it.
-            if index == units.count - 1, let eagerSource, let eagerText, source.hasPrefix(eagerSource) || eagerSource.hasPrefix(source) {
+            if eagerTranslation, index == units.count - 1, let eagerSource, let eagerText, source.hasPrefix(eagerSource) || eagerSource.hasPrefix(source) {
                 return Row(source: source, translation: eagerText, isProvisional: true, isComplete: complete)
             }
             return Row(source: source, translation: nil, isProvisional: false, isComplete: complete)

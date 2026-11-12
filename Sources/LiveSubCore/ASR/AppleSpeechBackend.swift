@@ -214,9 +214,10 @@ public final class AppleSpeechBackend: ASRBackend, @unchecked Sendable {
 
     private var fedFrames: Int64 = 0
 
-    public func finalizePending() {
+    public func finalizePending(secondsBack: Double) {
         guard let analyzer, let format else { return }
-        let through = CMTime(value: fedFrames, timescale: CMTimeScale(format.sampleRate))
+        let frames = max(0, fedFrames - Int64(secondsBack * format.sampleRate))
+        let through = CMTime(value: frames, timescale: CMTimeScale(format.sampleRate))
         Task { try? await analyzer.finalize(through: through) }
     }
 

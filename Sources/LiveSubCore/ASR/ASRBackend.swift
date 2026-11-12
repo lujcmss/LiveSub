@@ -52,7 +52,8 @@ public protocol ASRBackend: AnyObject, Sendable {
     func feed(_ buffer: AVAudioPCMBuffer)
     /// Ask for final results for everything fed so far, without ending recognition. Called at a
     /// pause in speech so finished sentences are committed (and translated) sooner.
-    func finalizePending()
+    /// `secondsBack` leaves the most recent audio uncommitted.
+    func finalizePending(secondsBack: Double)
     /// Flush pending audio, emit the last results and end the stream.
     func finish() async
 }

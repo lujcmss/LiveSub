@@ -28,6 +28,8 @@ struct OverlayConfig {
     var filePauseAt: Double?
     var filePauseFor = 0.0
     var filePauseSilence = false
+    var fileRewindAt: Double?
+    var fileRewindBy = 0.0
 }
 
 @MainActor
@@ -56,6 +58,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var isHovering = false
     private var isRepositioning = false
     private var isResizing = false
+    private var holdTimer: Timer?
     private var resizeStartHeight: CGFloat = 0
     private var snapshotIndex = 0
     private var lastSnapshot = ""
@@ -86,6 +89,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         copySettingsIntoConfig()
         let after = [config.language, config.appQuery ?? "", config.target ?? "", "\(config.saveSessions)"]
         panel.clickThrough = config.clickThrough
+        engine.eagerTranslation = settings.translateWhileSpeaking
+        pipeline?.commitAtPauses = settings.fasterSentences
         replay.lead = config.replayLead
         replay.linger = config.idleSeconds
         replay.saveEnabled = config.saveSessions
@@ -161,6 +166,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         replay = ReplayController(saveEnabled: config.saveSessions, lead: config.replayLead,
                                   linger: config.idleSeconds, stats: stats)
+        // Commit what was heard before the jump (recognizing the jump takes about a second).
+        replay.onRewind = { [weak self] in
+            guard let self else { return }
+            self.pipeline?.commitNow(secondsBack: (self.replay.sync?.secondsSinceReplayBegan ?? 1.0) + 0.4, endsSentence: true)
+        }
         replay.onStatus = { [weak self] status in
             guard let self else { return }
             if let status {
@@ -321,6 +331,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     f.pauseAt = config.filePauseAt
                     f.pauseFor = config.filePauseFor
                     f.pauseDeliversSilence = config.filePauseSilence
+                    f.rewindAt = config.fileRewindAt
+                    f.rewindBy = config.fileRewindBy
                     f.onEnd = { Task { @MainActor in self?.sourceEnded() } }
                     source = f
                     sourceName = f.label
@@ -354,6 +366,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let sync = self.replay.begin(language: language.id, target: self.engine.translator == nil ? nil : self.config.style.translationLanguage,
                                          sourceName: sourceName)
             let silence = SilenceWatch()
+            pipeline.commitAtPauses = self.settings.fasterSentences
             pipeline.onChunk = { chunk in
                 sync.ingest(chunk)
                 if let hearingSilence = silence.note(chunk) {
@@ -406,7 +419,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func saveSession(announce: Bool) {
-        guard let session = replay.save(translations: { [engine] in engine.translation(for: $0) }) else { return }
+        guard let session = replay.save() else { return }
         if announce {
             print(String(format: "Saved %d subtitles (%.0f s) for replay: %@", session.captions.count, session.duration,
                          replay.store.url(for: session.id).path))
@@ -460,7 +473,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case let .partial(text, _, received):
             engine.handlePartial(text)
             render(stamp: received)
-        case let .final(text, runs, latency, received):
+        case let .final(fullText, allRuns, latency, received):
+            // Words heard while a saved stretch was being replayed are already saved, and text
+            // that runs across a jump in playback is garbled: keep only what was new.
+            var text = fullText, runs = allRuns
+            if let sync = replay.sync, !runs.isEmpty {
+                let fresh = runs.filter { !sync.wasReplay(at: $0.start) }
+                if fresh.count != runs.count {
+                    runs = fresh
+                    text = fresh.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+            guard !text.isEmpty else {
+                engine.handlePartial("")
+                return
+            }
             let completed = engine.handleFinal(text, runs: runs)
             measureSentences(completed)
             recordCaptions(completed)
@@ -468,6 +495,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             render(stamp: received)
         case .sentence:
             break
+        case .sentenceBreak:
+            // A pause (or a jump in playback): close the sentence in progress so it is
+            // translated and saved now instead of being glued to whatever comes next.
+            if let tail = engine.flush() {
+                measureSentences([tail])
+                recordCaptions([tail])
+                render(stamp: nil)
+            }
         }
     }
 
@@ -557,8 +592,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         config.style.originalLanguage = source.id
         if let targetID = config.target { config.style.translationLanguage = TranslationLanguage(speechLocale: targetID).id }
-        engine = CaptionEngine(translator: translator, stats: stats)
+        engine = CaptionEngine(translator: translator, stats: stats, eagerTranslation: settings.translateWhileSpeaking)
         engine.onChange = { [weak self] in self?.render(stamp: nil) }
+        replay.translations = { [engine] in engine.translation(for: $0) }
         window.reset()
         applyStyle()
     }
@@ -580,11 +616,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             SubtitleView.Row(source: $0.source, translation: $0.translation, isProvisional: $0.isProvisional)
         }
         if !rows.isEmpty { rows[rows.count - 1].tentativeCount = engine.tentativeCount }
-        // A sentence that has only just begun (a few characters, no translation yet) does not
-        // push the finished sentence and its translation off screen: wait until it has
-        // something to show for itself.
-        if rows.count >= 2, let last = rows.last, last.translation == nil, last.source.count < 6 {
-            rows.removeLast()
+        // When only one sentence fits, a new sentence must not wipe the finished one before
+        // its translation could be read: hold the finished pair for a reading time (longer for
+        // longer translations), or until the new sentence has a translation of its own.
+        holdTimer?.invalidate()
+        if rows.count >= 2, let last = rows.last, last.translation == nil,
+           let previous = rows[rows.count - 2].translation, !view.fits(Array(rows.suffix(2))) {
+            let shownFor = visibleTranslations[rows[rows.count - 2].source].map { HostClock.ms(from: $0, to: HostClock.now()) / 1000 } ?? 0
+            let readingTime = min(3.0, 1.0 + 0.06 * Double(previous.count))
+            if shownFor < readingTime {
+                rows.removeLast()
+                holdTimer = Timer.scheduledTimer(withTimeInterval: readingTime - shownFor + 0.02, repeats: false) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.render(stamp: nil) }
+                }
+            }
         }
         // Start at a sentence boundary: drop whole leading sentences until the rest fits.
         if rows.isEmpty, SettingsWindowController.isOpen || isResizing {

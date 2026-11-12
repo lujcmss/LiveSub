@@ -18,6 +18,9 @@ final class ReplayController {
     var lead: Double
     /// Seconds a saved subtitle stays after its speech ends.
     var linger: Double
+    /// Called when the viewer skipped back within this session: the app should get everything
+    /// heard so far committed, so the replayed stretch has final text.
+    var onRewind: (() -> Void)?
     /// Called when replay starts, pauses, resumes or stops (argument: short status, nil = live).
     var onStatus: ((String?) -> Void)?
 
@@ -53,7 +56,8 @@ final class ReplayController {
         // Only sessions in the same languages can stand in for live subtitles.
         let usable = store.loadAll().filter { $0.sourceLanguage == language && $0.targetLanguage == target }
         savedCount = usable.count
-        let sync = ReplaySync(sessions: usable)
+        let sync = ReplaySync(sessions: usable, currentSessionID: recordingID)
+        currentSnapshot = nil
         sync.onStateChange = { state in
             DispatchQueue.main.async { MainActor.assumeIsolated { self.stateChanged(state) } }
         }
@@ -68,6 +72,8 @@ final class ReplayController {
         case .searching:
             print(String(format: "replay: lost sync, back to live subtitles (last match quality %.2f)", sync?.diagnostics.lockedErrorRate ?? 1))
         case let .locked(id, delta):
+            lastShownStart = -1
+            if id == recordingID { onRewind?() }
             let heard = sync?.recording().seconds ?? 0
             Log.debug(String(format: "replay: lock quality %.2f (0 = identical, 0.5 = unrelated, limit 0.30)", sync?.diagnostics.lockedErrorRate ?? 1))
             print(String(format: "replay: in sync with saved session %@ (offset %.2f s) after %.1f s of audio", String(id.prefix(8)), Double(delta) * AudioFingerprinter.hopSeconds, heard))
@@ -84,8 +90,15 @@ final class ReplayController {
             report(nil)
             return nil
         }
-        report(position.isPaused ? "Saved subtitles · paused" : "Saved subtitles · in sync, no delay")
-        let visible = position.session.captions(at: position.time, lead: lead, linger: linger)
+        // Either a session saved earlier, or (after skipping back) this very session.
+        let isRewind = position.session == nil
+        guard let session = position.session ?? currentSession() else {
+            report(nil)
+            return nil
+        }
+        report(position.isPaused ? "Saved subtitles · paused"
+               : isRewind ? "Replaying what you just watched · no delay" : "Saved subtitles · in sync, no delay")
+        let visible = session.captions(at: position.time, lead: lead, linger: linger)
         if let newest = visible.last, newest.start != lastShownStart, !position.isPaused {
             // Only count captions as they come up in normal playback, not ones already on screen
             // when sync was (re)gained.
@@ -103,21 +116,45 @@ final class ReplayController {
         onStatus?(status)
     }
 
+    /// Looks up the translation of a sentence from the current run (set by the app).
+    var translations: (String) -> String? = { _ in nil }
+    private var currentSnapshot: (count: Int, session: SubtitleSession)?
+
+    /// The run in progress as a session, for replaying after the viewer skips back.
+    private func currentSession() -> SubtitleSession? {
+        if let snapshot = currentSnapshot, snapshot.count == captions.count { return snapshot.session }
+        let session = SubtitleSession(id: recordingID, title: sourceName, createdAt: recordingStarted, sourceLanguage: language,
+                                      targetLanguage: target, duration: 0, captions: timedCaptions(), fingerprints: [])
+        currentSnapshot = (captions.count, session)
+        return session
+    }
+
+    private func timedCaptions() -> [SubtitleSession.Caption] {
+        captions.compactMap { c in
+            guard let start = c.start, let end = c.end else { return nil }
+            return .init(start: start, end: max(end, start), source: c.source, translation: translations(c.source))
+        }
+    }
+
     // MARK: Saving
 
     func record(_ new: [CaptionTimeline.Caption]) {
-        captions.append(contentsOf: new)
+        // Sentences heard while replaying are already saved (and may be garbled at the point
+        // where playback jumped): don't save them a second time.
+        captions.append(contentsOf: new.filter { c in
+            guard let sync, let start = c.start, let end = c.end else { return true }
+            // A scrap of a word or two right after a replay is the tail of a cut-off sentence.
+            if c.source.count <= 3, sync.replayEnded(shortlyBefore: start) { return false }
+            return !sync.wasReplay(at: start) && !sync.wasReplay(at: (start + end) / 2)
+        })
     }
 
     /// Write the current run to disk if it contains enough audio that was not already saved.
     @discardableResult
-    func save(translations: (String) -> String?) -> SubtitleSession? {
+    func save() -> SubtitleSession? {
         guard saveEnabled, let sync else { return nil }
         let recording = sync.recording()
-        let timed = captions.compactMap { c -> SubtitleSession.Caption? in
-            guard let start = c.start, let end = c.end else { return nil }
-            return .init(start: start, end: max(end, start), source: c.source, translation: translations(c.source))
-        }
+        let timed = timedCaptions()
         Log.debug(String(format: "save check: %.1f s heard, %.1f s new, %d captions (%d timed)", recording.seconds, recording.unmatchedSeconds, captions.count, timed.count))
         // A run that was (almost) entirely a replay adds nothing new.
         guard recording.unmatchedSeconds >= 10, !timed.isEmpty else { return nil }
