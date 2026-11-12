@@ -2,46 +2,112 @@ import AppKit
 
 /// Everything about how subtitles look. Milestone 5 exposes these in Settings.
 struct SubtitleStyle {
-    var fontName: String? = nil          // nil = system font
+    /// A font family name (default Avenir Next: elegant, open letterforms that stay legible over
+    /// video), or "system" (San Francisco) or "rounded" (San Francisco Rounded with rounded
+    /// Japanese/Chinese faces). Japanese, Chinese and Korean always get a matching-weight face.
+    var fontName = "Avenir Next"
+    /// Size of the main line: the translation when one is shown, otherwise the original.
     var fontSize: CGFloat = 30
     var textColor: NSColor = .white
-    /// How much dimmer not-yet-final text is drawn.
-    var volatileOpacity: CGFloat = 0.6
+    /// How much dimmer still-changing text is drawn.
+    var volatileOpacity: CGFloat = 0.55
     var backgroundColor: NSColor = .black
     var backgroundOpacity: CGFloat = 0.62
-    /// Lines of original text (and, when both are shown, as many again for the translation).
+    /// Lines for the main text (and, when both are shown, as many again for the original).
     var maxLines = 2
-    var translationColor = NSColor(calibratedRed: 1.0, green: 0.86, blue: 0.45, alpha: 1)
-    /// Translation size relative to the original when both are shown.
-    var translationScale: CGFloat = 0.92
+    /// Color of the original-language line when it is shown above its translation.
+    var originalColor = NSColor(calibratedRed: 1.0, green: 0.87, blue: 0.52, alpha: 1)
+    /// Size of the original-language line relative to the translation when both are shown.
+    var originalScale: CGFloat = 0.7
     var mode: DisplayMode = .both
+    var cornerRadius: CGFloat = 14
+    var padding = NSSize(width: 22, height: 12)
+    /// Language of each line ("ja", "ko", "zh-Hans", …), used to pick matching CJK glyphs.
+    var originalLanguage = "ja"
+    var translationLanguage = "en"
 
     enum DisplayMode: String { case originalOnly, both, translationOnly }
 
     /// Total lines the overlay may use in the current mode.
     var lineBudget: Int { mode == .both ? maxLines * 2 : maxLines }
-    var cornerRadius: CGFloat = 14
-    var padding = NSSize(width: 22, height: 12)
 
-    var font: NSFont {
-        if let fontName, let f = NSFont(name: fontName, size: fontSize) { return f }
-        return .systemFont(ofSize: fontSize, weight: .semibold)
+    enum Role { case original, translation }
+
+    /// Whether `role` is the small secondary line (only the original, and only in `.both`).
+    private func isSecondary(_ role: Role) -> Bool { role == .original && mode == .both }
+
+    func font(for role: Role) -> NSFont {
+        let size = isSecondary(role) ? fontSize * originalScale : fontSize
+        let language = role == .original ? originalLanguage : translationLanguage
+        return Self.makeFont(name: fontName, size: size, language: language)
     }
 
-    var lineHeight: CGFloat {
-        let lm = NSLayoutManager()
-        return ceil(lm.defaultLineHeight(for: font))
+    /// Builds the font with a fallback chain so CJK text uses a face that matches the Latin one
+    /// and the right regional glyph shapes (Japanese kanji vs. Chinese hanzi).
+    static func makeFont(name: String, size: CGFloat, language: String) -> NSFont {
+        let base: NSFont
+        // Clean sans faces at a weight that matches a demi-bold Latin font.
+        var cjk: [String]
+        switch language {
+        case "ja": cjk = ["HiraginoSans-W6"]
+        case "zh-Hant": cjk = ["PingFangTC-Semibold", "PingFangSC-Semibold"]
+        case "zh-Hans": cjk = ["PingFangSC-Semibold", "PingFangTC-Semibold"]
+        case "ko": cjk = ["AppleSDGothicNeo-SemiBold"]
+        default: cjk = []
+        }
+        switch name {
+        case "system":
+            base = .systemFont(ofSize: size, weight: .semibold)
+        case "rounded":
+            let rounded = NSFont.systemFont(ofSize: size, weight: .semibold).fontDescriptor.withDesign(.rounded)
+            base = rounded.flatMap { NSFont(descriptor: $0, size: size) } ?? .systemFont(ofSize: size, weight: .semibold)
+            switch language {
+            case "ja": cjk = ["HiraMaruProN-W4"]
+            case "zh-Hant": cjk = ["STYuanti-TC-Bold", "STYuanti-SC-Bold"]
+            case "zh-Hans": cjk = ["STYuanti-SC-Bold", "STYuanti-TC-Bold"]
+            default: break
+            }
+        default:
+            // Weight 8 of 15 is demi-bold: sturdy enough over video without looking heavy.
+            base = NSFontManager.shared.font(withFamily: name, traits: [], weight: 8, size: size)
+                ?? NSFont(name: name, size: size) ?? .systemFont(ofSize: size, weight: .semibold)
+        }
+        guard !cjk.isEmpty else { return base }
+        let cascade = cjk.map { NSFontDescriptor(name: $0, size: size) }
+        let descriptor = base.fontDescriptor.addingAttributes([.cascadeList: cascade])
+        return NSFont(descriptor: descriptor, size: size) ?? base
     }
 
-    func translationAttributes(provisional: Bool, primary: Bool) -> [NSAttributedString.Key: Any] {
-        var attrs = attributes(volatile: provisional)
-        let size = primary ? fontSize : fontSize * translationScale
-        attrs[.font] = fontName.flatMap { NSFont(name: $0, size: size) } ?? .systemFont(ofSize: size, weight: .semibold)
-        attrs[.foregroundColor] = (primary ? textColor : translationColor).withAlphaComponent(provisional ? volatileOpacity : 1)
-        return attrs
+    /// Extra space above each sentence pair after the first, so pairs read as units.
+    var pairSpacing: CGFloat { (fontSize * 0.4).rounded() }
+
+    /// Measured height of one line of `role` text in its language (fonts differ a lot here).
+    func lineHeight(for role: Role) -> CGFloat {
+        let language = role == .original ? originalLanguage : translationLanguage
+        let sample: String
+        switch language {
+        case "ja": sample = "あ漢g"
+        case "zh-Hans", "zh-Hant": sample = "汉g"
+        case "ko": sample = "한g"
+        default: sample = "Ag"
+        }
+        let text = NSAttributedString(string: sample, attributes: attributes(role, dim: false))
+        return TailFitter.layout(text, width: 2000).size.height
     }
 
-    func attributes(volatile: Bool) -> [NSAttributedString.Key: Any] {
+    /// Height needed for the current mode's line budget.
+    var contentHeight: CGFloat {
+        switch mode {
+        case .both:
+            return CGFloat(maxLines) * (lineHeight(for: .original) + lineHeight(for: .translation))
+                + CGFloat(max(0, maxLines - 1)) * pairSpacing
+        case .originalOnly: return CGFloat(maxLines) * lineHeight(for: .original)
+        case .translationOnly: return CGFloat(maxLines) * max(lineHeight(for: .translation), lineHeight(for: .original))
+        }
+    }
+
+    /// Text attributes for a line. `dim` marks text that may still change.
+    func attributes(_ role: Role, dim: Bool, spacingBefore: CGFloat = 0) -> [NSAttributedString.Key: Any] {
         let shadow = NSShadow()
         shadow.shadowColor = NSColor.black.withAlphaComponent(0.8)
         shadow.shadowBlurRadius = 3
@@ -51,9 +117,13 @@ struct SubtitleStyle {
         paragraph.lineBreakMode = .byWordWrapping
         // Prefer breaking Japanese/Korean lines between phrases rather than mid-word.
         paragraph.lineBreakStrategy = [.standard, .hangulWordPriority]
+        // (No fixed line height: TextKit inflates Hiragino lines when one is set, so line
+        // heights are measured instead; see `lineHeight(for:)`.)
+        paragraph.paragraphSpacingBefore = spacingBefore
+        let color = isSecondary(role) ? originalColor : textColor
         return [
-            .font: font,
-            .foregroundColor: textColor.withAlphaComponent(volatile ? volatileOpacity : 1),
+            .font: font(for: role),
+            .foregroundColor: color.withAlphaComponent(dim ? volatileOpacity : 1),
             .shadow: shadow,
             .paragraphStyle: paragraph,
         ]

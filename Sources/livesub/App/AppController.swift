@@ -236,6 +236,8 @@ final class AppController: NSObject, NSApplicationDelegate {
                 }
             }
         }
+        config.style.originalLanguage = source.id
+        if let targetID = config.target { config.style.translationLanguage = TranslationLanguage(speechLocale: targetID).id }
         engine = CaptionEngine(translator: translator, stats: stats)
         engine.onChange = { [weak self] in self?.render(stamp: nil) }
         window.reset()

@@ -36,7 +36,7 @@ final class OverlayPanel: NSPanel {
 
     /// Height follows the style (lines × line height); the user controls width and position.
     func applyHeight(for style: SubtitleStyle) {
-        let height = CGFloat(style.lineBudget) * style.lineHeight + style.padding.height * 2 + 8
+        let height = style.contentHeight + style.padding.height * 2 + 8
         contentMinSize = NSSize(width: 320, height: height)
         contentMaxSize = NSSize(width: 10_000, height: height)
         var f = frame
@@ -129,8 +129,9 @@ final class SubtitleView: NSView {
 
     private func composed() -> NSAttributedString {
         if let notice {
-            var attrs = style.attributes(volatile: true)
+            var attrs = style.attributes(.translation, dim: true)
             attrs[.font] = NSFont.systemFont(ofSize: max(14, style.fontSize * 0.6), weight: .medium)
+            attrs[.foregroundColor] = style.textColor.withAlphaComponent(0.85)
             return NSAttributedString(string: notice, attributes: attrs)
         }
         return compose(rows)
@@ -143,44 +144,45 @@ final class SubtitleView: NSView {
             out.append(NSAttributedString(string: text, attributes: attrs))
         }
         /// Original text with its still-changing ending dimmed.
-        func appendSource(_ row: Row, dimAll: Bool = false) {
+        func appendOriginal(_ row: Row, dimAll: Bool = false, spacingBefore: CGFloat = 0) {
             let dim = dimAll ? row.source.count : min(row.tentativeCount, row.source.count)
-            append(String(row.source.dropLast(dim)), style.attributes(volatile: false))
-            append(String(row.source.suffix(dim)), style.attributes(volatile: true))
+            append(String(row.source.dropLast(dim)), style.attributes(.original, dim: false, spacingBefore: spacingBefore))
+            append(String(row.source.suffix(dim)), style.attributes(.original, dim: true, spacingBefore: spacingBefore))
         }
         /// Space between sentences, except between CJK characters.
-        func appendSeparator(before next: String) {
+        func appendSeparator(before next: String, _ role: SubtitleStyle.Role) {
             guard let a = out.string.unicodeScalars.last, let b = next.unicodeScalars.first else { return }
-            if !(SentenceSegmenter.isCJK(a) || SentenceSegmenter.isCJK(b)) { append(" ", style.attributes(volatile: false)) }
+            if !(SentenceSegmenter.isCJK(a) || SentenceSegmenter.isCJK(b)) { append(" ", style.attributes(role, dim: false)) }
         }
         switch style.mode {
         case .originalOnly:
             // One flowing paragraph.
             for row in rows {
-                appendSeparator(before: row.source)
-                appendSource(row)
+                appendSeparator(before: row.source, .original)
+                appendOriginal(row)
             }
         case .translationOnly:
             // One flowing paragraph of translations; a sentence that has no translation yet
             // shows its original text dimmed so nothing is ever missing.
             for row in rows {
                 let text = row.translation ?? row.source
-                appendSeparator(before: text)
+                appendSeparator(before: text, .translation)
                 if let t = row.translation {
-                    append(t, style.translationAttributes(provisional: row.isProvisional, primary: true))
+                    append(t, style.attributes(.translation, dim: row.isProvisional))
                 } else {
-                    appendSource(row, dimAll: true)
+                    appendOriginal(row, dimAll: true)
                 }
             }
         case .both:
-            // Each sentence on its own line(s) with its translation directly beneath.
+            // Each sentence: the original, small, with its translation directly beneath.
             for (i, row) in rows.enumerated() {
-                if i > 0 { append("\n", style.attributes(volatile: false)) }
-                appendSource(row)
-                append("\n", style.attributes(volatile: false))
+                if i > 0 { append("\n", style.attributes(.translation, dim: false)) }
+                let gap = i > 0 ? style.pairSpacing : 0
+                appendOriginal(row, spacingBefore: gap)
+                append("\n", style.attributes(.original, dim: false, spacingBefore: gap))
                 // The translation line is reserved with "…" so the layout does not jump when
                 // the translation arrives.
-                append(row.translation ?? "…", style.translationAttributes(provisional: row.translation == nil || row.isProvisional, primary: false))
+                append(row.translation ?? "…", style.attributes(.translation, dim: row.translation == nil || row.isProvisional))
             }
         }
         return out
@@ -205,6 +207,12 @@ final class SubtitleView: NSView {
         }
         let available = textWidth
         if let fitted = TailFitter.fit(composed(), width: available, maxLines: style.lineBudget), !fitted.lines.isEmpty {
+            if Log.verbose {
+                var heights: [String] = []
+                let glyphs = fitted.manager.glyphRange(for: fitted.container)
+                fitted.manager.enumerateLineFragments(forGlyphRange: glyphs) { rect, _, _, _, _ in heights.append(String(format: "%.0f", rect.height)) }
+                Log.debug("layout: lines \(heights.joined(separator: ",")) total \(fitted.size.height) in view \(bounds.height)")
+            }
             // Pill hugs the text, centered, sitting on the bottom edge of the window.
             let pillSize = NSSize(width: fitted.size.width + style.padding.width * 2,
                                   height: fitted.size.height + style.padding.height * 2)

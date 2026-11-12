@@ -61,6 +61,7 @@ struct Options {
     var text: String?
     var translationOnly = false
     var release = false
+    var font: String?
 }
 
 func parse(_ args: [String]) -> Options {
@@ -86,6 +87,7 @@ func parse(_ args: [String]) -> Options {
         case "--text": o.text = val()
         case "--translation-only": o.translationOnly = true
         case "--release": o.release = true
+        case "--font": o.font = val()
         case "--idle-seconds": o.idleSeconds = Double(val())
         case "--snapshot": o.snapshot = (val() as NSString).expandingTildeInPath
         case "--out": o.out = URL(fileURLWithPath: (val() as NSString).expandingTildeInPath)
@@ -326,6 +328,7 @@ MainActor.assumeIsolated {
             config.engine = opts.engine == "dictation" ? .dictation : opts.engine == "speech" ? .speechTranscriber : nil
             config.chunkDuration = opts.chunkMS / 1000
             if let size = opts.fontSize { config.style.fontSize = size }
+            if let font = opts.font { config.style.fontName = font }
             if let lines = opts.lines { config.style.maxLines = max(1, lines) }
             if let idle = opts.idleSeconds { config.idleSeconds = idle }
             config.clickThrough = opts.clickThrough
