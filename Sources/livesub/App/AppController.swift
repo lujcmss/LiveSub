@@ -117,6 +117,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             DispatchQueue.main.async { MainActor.assumeIsolated { self?.settingsChanged() } }
         }
         panel = OverlayPanel(style: config.style)
+        panel.remembersFrame = settings.persist
         panel.clickThrough = config.clickThrough
         panel.subtitleView.onDrawn = { [stats] stamp in
             stats.record(TranscriptionPipeline.Stage.display, ms: HostClock.ms(from: stamp, to: HostClock.now()))

@@ -111,7 +111,11 @@ final class OverlayPanel: NSPanel {
         setFrame(NSRect(origin: origin, size: NSSize(width: width, height: frame.height)), display: true)
     }
 
+    /// false in timed test runs, so they never disturb the position the user chose.
+    var remembersFrame = true
+
     @objc private func frameChanged() {
+        guard remembersFrame else { return }
         UserDefaults.standard.set(NSStringFromRect(frame), forKey: Self.frameKey)
     }
 
